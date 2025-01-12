@@ -56,6 +56,7 @@ impl TTSKoko {
             0, 50, 83, 54, 156, 57, 135, 3, 16, 65, 156, 87, 158, 54, 46, 5, 0,
         ]];
         let tokens: Vec<Vec<i64>> = tokens.iter().map(|&row| row.to_vec()).collect();
+        println!("tokens: {:?}", tokens);
         let styles: Vec<Vec<f32>> = self
             .styles
             .values()
