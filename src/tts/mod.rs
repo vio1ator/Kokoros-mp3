@@ -1,3 +1,5 @@
 pub mod koko;
+pub mod normalize;
 pub mod phonemizer;
-pub mod tokenizer;
+pub mod tokenize;
+pub mod vocab;

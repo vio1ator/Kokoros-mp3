@@ -1,3 +1,4 @@
+use crate::tts::vocab::VOCAB;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
@@ -57,6 +58,8 @@ impl TTSKoko {
         ]];
         let tokens: Vec<Vec<i64>> = tokens.iter().map(|&row| row.to_vec()).collect();
         println!("tokens: {:?}", tokens);
+
+        println!("VOCAB: {:#?}", *VOCAB);
         let styles: Vec<Vec<f32>> = self
             .styles
             .values()
