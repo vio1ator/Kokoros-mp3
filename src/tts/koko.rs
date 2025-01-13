@@ -80,7 +80,8 @@ impl TTSKoko {
 
         // save out to audio.wav
         if let Ok(out) = out {
-            self.process_and_save_audio(start_t, out, 512)
+            let phonemes_len = phonemes.len();
+            self.process_and_save_audio(start_t, out, phonemes_len)
                 .expect("save audio failed.");
         }
     }
