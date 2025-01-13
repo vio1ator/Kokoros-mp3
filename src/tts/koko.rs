@@ -1,3 +1,5 @@
+use crate::tts::tokenize::tokenize;
+use crate::tts::vocab::print_sorted_reverse_vocab;
 use crate::tts::vocab::VOCAB;
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,13 +55,13 @@ impl TTSKoko {
         // tokens, styles, speed
         // i32, i32
 
-        let tokens = [[
-            0, 50, 83, 54, 156, 57, 135, 3, 16, 65, 156, 87, 158, 54, 46, 5, 0,
-        ]];
-        let tokens: Vec<Vec<i64>> = tokens.iter().map(|&row| row.to_vec()).collect();
+        let phonemes = "ɛz ju brið ɪn ðə dɛpθs əv jʊr soʊl, rɪˈmɛmbər ðət ˈɛvəri ˈhɑrtˌbit ɪz ə riˈmaɪndər əv jʊr ˈɪnfənət pəˈtɛnʃəl, ənd ˈɛvəri brɛθ ɪz ə ʧæns tɪ əˈweɪkən tɪ ðə ˈlɪmətləs ˈbjuti ənd ˈwɪzdəm ðət laɪz wɪˈθɪn ju.";
+        let tokens = vec![tokenize(phonemes)];
+
         println!("tokens: {:?}", tokens);
 
         println!("VOCAB: {:#?}", *VOCAB);
+        print_sorted_reverse_vocab();
         let styles: Vec<Vec<f32>> = self
             .styles
             .values()
@@ -71,23 +73,24 @@ impl TTSKoko {
             })
             .unwrap_or_else(|| vec![vec![0.0; 256]]);
 
+        let start_t = Instant::now();
+
         let out = self.model.infer(tokens, styles);
         println!("output: {:?}", out);
 
         // save out to audio.wav
         if let Ok(out) = out {
-            self.process_and_save_audio(out, 512)
+            self.process_and_save_audio(start_t, out, 512)
                 .expect("save audio failed.");
         }
     }
 
     fn process_and_save_audio(
         &self,
+        start_t: Instant,
         output: ArrayBase<OwnedRepr<f32>, IxDyn>,
         phonemes_len: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let start_t = Instant::now();
-
         // Convert output to standard Vec
         let audio: Vec<f32> = output.iter().cloned().collect();
 
@@ -113,7 +116,7 @@ impl TTSKoko {
             sample_format: hound::SampleFormat::Float,
         };
 
-        let mut writer = hound::WavWriter::create("output.wav", spec)?;
+        let mut writer = hound::WavWriter::create("tmp/output.wav", spec)?;
 
         for &sample in &audio {
             writer.write_sample(sample)?;

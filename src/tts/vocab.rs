@@ -18,6 +18,20 @@ pub fn get_vocab() -> std::collections::HashMap<char, usize> {
         .collect()
 }
 
+pub fn get_reverse_vocab() -> HashMap<usize, char> {
+    VOCAB.iter().map(|(&c, &idx)| (idx, c)).collect()
+}
+
+pub fn print_sorted_reverse_vocab() {
+    let mut sorted_keys: Vec<_> = REVERSE_VOCAB.keys().collect();
+    sorted_keys.sort();
+
+    for key in sorted_keys {
+        println!("{}: {}", key, REVERSE_VOCAB[key]);
+    }
+}
+
 lazy_static! {
     pub static ref VOCAB: HashMap<char, usize> = get_vocab();
+    pub static ref REVERSE_VOCAB: HashMap<usize, char> = get_reverse_vocab();
 }
