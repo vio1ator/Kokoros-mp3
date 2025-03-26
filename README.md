@@ -9,9 +9,11 @@
 ## [Orpheus-TTS On The Way?](https://github.com/lucasjinreal/Kokoros/issues/75)
 
 
-**AMSR**
+**ASMR**
 
 https://github.com/user-attachments/assets/1043dfd3-969f-4e10-8b56-daf8285e7420
+
+(typo in video, ignore it)
 
 **Digital Human**
 
