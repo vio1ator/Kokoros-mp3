@@ -9,20 +9,21 @@ COPY . .
 COPY Cargo.toml .
 COPY Cargo.lock .
 
-RUN cargo build --release
 RUN chmod +x ./download_all.sh && ./download_all.sh
+
+RUN cargo build --release
 
 FROM debian:sid-slim AS runner
 
 WORKDIR /app
 
-COPY --from=builderrs /app/target/release/build ./build
-COPY --from=builderrs /app/target/release/koko ./koko
+COPY --from=builderrs /app/target/release/build ./target/release/build
+COPY --from=builderrs /app/target/release/koko ./target/release/koko
 COPY --from=builderrs /app/data ./data
 COPY --from=builderrs /app/checkpoints ./checkpoints
 
-RUN chmod +x ./koko && apt-get update -qq && apt-get install -qq -y pkg-config libssl-dev 
+RUN chmod +x ./target/release/koko && apt-get update -qq && apt-get install -qq -y pkg-config libssl-dev 
 
 EXPOSE 3000
 
-ENTRYPOINT [ "./koko" ]
+ENTRYPOINT [ "./target/release/koko" ]
