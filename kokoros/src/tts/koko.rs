@@ -180,7 +180,7 @@ impl TTSKoko {
             let phonemes = text_to_phonemes(&chunk, lan, None, true, false)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
                 .join("");
-            println!("phonemes: {}", phonemes);
+            eprintln!("phonemes: {}", phonemes);
             let mut tokens = tokenize(&phonemes);
 
             for _ in 0..initial_silence.unwrap_or(0) {
@@ -333,7 +333,7 @@ impl TTSKoko {
             voices
         };
 
-        println!("voice styles loaded: {:?}", sorted_voices);
+        eprintln!("voice styles loaded: {:?}", sorted_voices);
         map
     }
 }
