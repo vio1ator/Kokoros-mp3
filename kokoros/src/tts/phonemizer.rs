@@ -25,7 +25,7 @@ impl EspeakBackend {
         }
     }
 
-    fn phonemize(&self, text: &[String]) -> Option<Vec<String>> {
+    fn phonemize(&self, _text: &[String]) -> Option<Vec<String>> {
         // Implementation would go here
         // This is where you'd integrate with actual espeak bindings
         todo!("Implement actual phonemization")
