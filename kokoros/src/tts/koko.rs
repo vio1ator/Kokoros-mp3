@@ -1,13 +1,12 @@
-use crate::tts::tokenize::tokenize;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-
 use crate::onn::ort_koko::{self};
+use crate::tts::tokenize::tokenize;
 use crate::utils;
 use ndarray::Array3;
 use ndarray_npy::NpzReader;
+use std::collections::HashMap;
 use std::fs::File;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use espeak_rs::text_to_phonemes;
 
@@ -26,7 +25,7 @@ pub struct TTSOpts<'a> {
 pub struct TTSKoko {
     #[allow(dead_code)]
     model_path: String,
-    model: Arc<ort_koko::OrtKoko>,
+    model: Arc<Mutex<ort_koko::OrtKoko>>,
     styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
     init_config: InitConfig,
 }
@@ -66,11 +65,10 @@ impl TTSKoko {
                 .expect("download voices data file failed.");
         }
 
-        let model = Arc::new(
-            ort_koko::OrtKoko::new(model_path.to_string())
-                .expect("Failed to create Kokoro TTS model"),
-        );
 
+        let model = Arc::new(Mutex::new(
+            ort_koko::OrtKoko::new(model_path.to_string()).expect("Failed to create Kokoro TTS model"),
+        ));
         // TODO: if(not streaming) { model.print_info(); }
         // model.print_info();
 
@@ -199,7 +197,12 @@ impl TTSKoko {
 
             let tokens = vec![padded_tokens];
 
-            match self.model.infer(tokens, styles.clone(), speed) {
+            match self
+                .model
+                .lock()
+                .unwrap()
+                .infer(tokens, styles.clone(), speed)
+            {
                 Ok(chunk_audio) => {
                     let chunk_audio: Vec<f32> = chunk_audio.iter().cloned().collect();
                     final_audio.extend_from_slice(&chunk_audio);
@@ -299,7 +302,7 @@ impl TTSKoko {
             for (name, portion) in style_names.iter().zip(style_portions.iter()) {
                 if let Some(style) = self.styles.get(*name) {
                     let style_slice = &style[tokens_len][0]; // This is a [256] array
-                                                             // Blend into the blended_style
+                    // Blend into the blended_style
                     for j in 0..256 {
                         blended_style[0][j] += style_slice[j] * portion;
                     }

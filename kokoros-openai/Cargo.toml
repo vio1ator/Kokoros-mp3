@@ -1,11 +1,11 @@
 [package]
 name = "kokoros-openai"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 kokoros = { path = "../kokoros" }
 
-axum = { version = "0.7", features = ["http2"] }
-serde = { version = "1.0", features = ["derive"] }
-tower-http = { version = "0.5", features = ["cors"] }
+axum = { version = "0.8.4", features = ["http2"] }
+serde = { version = "1.0.219", features = ["derive"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
