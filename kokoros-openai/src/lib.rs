@@ -9,7 +9,7 @@ use kokoros::{
     utils::mp3::pcm_to_mp3,
     utils::wav::{write_audio_chunk, WavHeader},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 #[derive(Deserialize, Default, Debug)]
@@ -61,12 +61,18 @@ struct SpeechRequest {
     initial_silence: Option<usize>,
 }
 
+#[derive(Serialize)]
+struct VoicesResponse {
+    voices: Vec<String>,
+}
+
 pub async fn create_server(tts: TTSKoko) -> Router {
     println!("create_server()");
 
     Router::new()
         .route("/", get(handle_home))
         .route("/v1/audio/speech", post(handle_tts))
+        .route("/v1/audio/voices", get(handle_voices))
         .layer(CorsLayer::permissive())
         .with_state(tts)
 }
@@ -145,4 +151,9 @@ async fn handle_tts(
         .map_err(|e| {
             SpeechError::Mp3Conversion(std::io::Error::new(std::io::ErrorKind::Other, e))
         })?)
+}
+
+async fn handle_voices(State(tts): State<TTSKoko>) -> Json<VoicesResponse> {
+    let voices = tts.get_available_voices();
+    Json(VoicesResponse { voices })
 }
