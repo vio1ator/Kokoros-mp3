@@ -339,4 +339,11 @@ impl TTSKoko {
         eprintln!("voice styles loaded: {:?}", sorted_voices);
         map
     }
+
+    /// Returns a sorted list of available voice names
+    pub fn get_available_voices(&self) -> Vec<String> {
+        let mut voices: Vec<String> = self.styles.keys().cloned().collect();
+        voices.sort();
+        voices
+    }
 }
