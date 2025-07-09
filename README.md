@@ -44,7 +44,8 @@ New Discord community: https://discord.gg/E566zfDWqD, Please join us if you inte
 
 ## Updates
 
-- **_`2025.01.22`_**: 🔥🔥🔥 **Streaming mode supported.** You can now using `--stream` to have fun with stream mode, kudos to [mroigo](https://github.com/mrorigo);
+- **_`2025.07.09`_**: 🔥🔥🔥 **HTTP API streaming supported.** OpenAI-compatible server now supports streaming audio generation with `"stream": true` for low-latency responses;
+- **_`2025.01.22`_**: 🔥🔥🔥 **CLI streaming mode supported.** You can now using `--stream` to have fun with stream mode, kudos to [mroigo](https://github.com/mrorigo);
 - **_`2025.01.17`_**: 🔥🔥🔥 Style mixing supported! Now, listen the output AMSR effect by simply specific style: `af_sky.4+af_nicole.5`;
 - **_`2025.01.15`_**: OpenAI compatible server supported, openai format still under polish!
 - **_`2025.01.15`_**: Phonemizer supported! Now `Kokoros` can inference E2E without anyother dependencies! Kudos to [@tstm](https://github.com/tstm);
@@ -118,14 +119,37 @@ For a file with 3 lines of text, by default, speech audio files `tmp/output_0.wa
 Using curl:
 
 ```bash
+# Standard audio generation
 curl -X POST http://localhost:3000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "anything can go here",
+    "model": "tts-1",
     "input": "Hello, this is a test of the Kokoro TTS system!",
     "voice": "af_sky"
-  }'
+  }' \
   --output sky-says-hello.wav
+
+# Streaming audio generation (PCM format only)
+curl -X POST http://localhost:3000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "tts-1",
+    "input": "This is a streaming test with real-time audio generation.",
+    "voice": "af_sky",
+    "stream": true
+  }' \
+  --output streaming-audio.pcm
+
+# Live streaming playback (requires ffplay)
+curl -s -X POST http://localhost:3000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "tts-1",
+    "input": "Hello streaming world!",
+    "voice": "af_sky",
+    "stream": true
+  }' | \
+  ffplay -f s16le -ar 24000 -nodisp -autoexit -loglevel quiet -
 ```
 
 Using Python:
