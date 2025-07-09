@@ -1033,6 +1033,7 @@ dependencies = [
  "axum",
  "kokoros",
  "serde",
+ "serde_json",
  "tower-http",
 ]
 
