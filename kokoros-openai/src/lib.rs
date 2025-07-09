@@ -42,6 +42,46 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+/// Split text into speech chunks for streaming
+/// 
+/// Prioritizes sentence boundaries over word count for natural speech breaks
+fn split_text_into_speech_chunks(text: &str, words_per_chunk: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    let mut word_count = 0;
+    
+    for word in text.split_whitespace() {
+        if !current_chunk.is_empty() {
+            current_chunk.push(' ');
+        }
+        current_chunk.push_str(word);
+        word_count += 1;
+        
+        // Check for sentence endings (major breaks)
+        let ends_with_sentence = word.ends_with('.') || word.ends_with('!') || word.ends_with('?');
+        
+        // Check for minor breaks (commas, semicolons, colons)
+        let ends_with_minor_punct = word.ends_with(',') || word.ends_with(';') || word.ends_with(':');
+        
+        // Split conditions (prioritize sentence boundaries):
+        // 1. Sentence ending + minimum word count reached
+        // 2. Minor punctuation + target word count reached
+        // 3. Hard limit to prevent overly long chunks
+        if (ends_with_sentence && word_count >= words_per_chunk / 2) ||
+           (ends_with_minor_punct && word_count >= words_per_chunk) ||
+           (word_count >= words_per_chunk * 3) {
+            chunks.push(current_chunk.trim().to_string());
+            current_chunk.clear();
+            word_count = 0;
+        }
+    }
+    
+    if !current_chunk.trim().is_empty() {
+        chunks.push(current_chunk.trim().to_string());
+    }
+    
+    chunks
+}
 
 #[derive(Deserialize, Default, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -154,26 +194,28 @@ struct StreamingSession {
     start_time: Instant,
 }
 
-/// TTS worker pool manager
+/// TTS worker pool manager with multiple TTS instances
 #[derive(Clone)]
 struct TTSWorkerPool {
-    tts: Arc<TTSKoko>,
-    tts_lock: Arc<tokio::sync::Mutex<()>>,
+    tts_instances: Vec<Arc<TTSKoko>>,
     max_concurrent: usize,
 }
 
 impl TTSWorkerPool {
-    fn new(tts: TTSKoko, max_concurrent: usize) -> Self {
+    fn new(tts_instances: Vec<TTSKoko>) -> Self {
+        let num_instances = tts_instances.len();
         Self {
-            tts: Arc::new(tts),
-            tts_lock: Arc::new(tokio::sync::Mutex::new(())),
-            max_concurrent,
+            tts_instances: tts_instances.into_iter().map(Arc::new).collect(),
+            max_concurrent: num_instances,
         }
+    }
+    
+    fn get_instance(&self, worker_id: usize) -> Arc<TTSKoko> {
+        let index = worker_id % self.tts_instances.len();
+        Arc::clone(&self.tts_instances[index])
     }
 
     async fn process_chunk(&self, task: TTSTask) {
-        let tts_clone = Arc::clone(&self.tts);
-        let tts_lock = Arc::clone(&self.tts_lock);
         let start_time = Instant::now();
         
         // Clone data for the closure
@@ -183,22 +225,16 @@ impl TTSWorkerPool {
         let initial_silence = task.initial_silence;
         let chunk_id = task.id;
         
+        // Get dedicated TTS instance for this worker
+        let tts_instance = self.get_instance(chunk_id);
+        
         eprintln!("Starting TTS processing for chunk {} with text: '{}'", chunk_id, &chunk_text);
         
-        // Run TTS inference in a blocking thread with comprehensive error handling
-        // Actually use the tts_lock to prevent concurrent model access
+        // Run TTS inference in a blocking thread with dedicated instance
+        // NO GLOBAL LOCK - each worker gets its own TTS instance
         let result = tokio::task::spawn_blocking(move || {
-            // Introduce small delay based on chunk ID to stagger starts
-            if chunk_id > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(chunk_id as u64 * 40));
-            }
-            
-            // Acquire the lock and process TTS - remove panic handler to avoid UnwindSafe issues
-            let _lock_guard = tts_lock.blocking_lock();
-            eprintln!("Acquired TTS lock for chunk {}", chunk_id);
-            
-            eprintln!("Calling tts_raw_audio for chunk {}", chunk_id);
-            let audio_result = tts_clone.tts_raw_audio(&chunk_text, "en-us", &voice, speed, initial_silence);
+            eprintln!("Calling tts_raw_audio for chunk {} with dedicated instance", chunk_id);
+            let audio_result = tts_instance.tts_raw_audio(&chunk_text, "en-us", &voice, speed, initial_silence);
             eprintln!("Completed tts_raw_audio call for chunk {}", chunk_id);
             
             audio_result.map(|audio| {
@@ -263,8 +299,11 @@ struct ModelsResponse {
     data: Vec<ModelObject>,
 }
 
-pub async fn create_server(tts: TTSKoko) -> Router {
-    println!("create_server()");
+pub async fn create_server(tts_instances: Vec<TTSKoko>) -> Router {
+    println!("create_server() with {} TTS instances", tts_instances.len());
+
+    // Use first instance for compatibility with non-streaming endpoints
+    let tts_single = tts_instances.first().cloned().expect("At least one TTS instance required");
 
     Router::new()
         .route("/", get(handle_home))
@@ -273,7 +312,7 @@ pub async fn create_server(tts: TTSKoko) -> Router {
         .route("/v1/models", get(handle_models))
         .route("/v1/models/{model}", get(handle_model))
         .layer(CorsLayer::permissive())
-        .with_state(tts)
+        .with_state((tts_single, tts_instances))
 }
 
 pub use axum::serve;
@@ -320,7 +359,7 @@ async fn handle_home() -> &'static str {
 }
 
 async fn handle_tts(
-    State(tts): State<TTSKoko>,
+    State((tts_single, tts_instances)): State<(TTSKoko, Vec<TTSKoko>)>,
     request: axum::extract::Request,
 ) -> Result<Response, SpeechError> {
     // Check if this is a streaming request by examining headers
@@ -403,11 +442,11 @@ async fn handle_tts(
     if should_stream {
         eprintln!("Using async streaming: explicit={}, detected_streaming_headers={}", 
                   stream.unwrap_or(false), is_streaming_request);
-        return handle_tts_streaming(tts, input, voice, response_format, speed, initial_silence).await;
+        return handle_tts_streaming(tts_instances, input, voice, response_format, speed, initial_silence).await;
     }
 
     // Non-streaming mode (existing implementation)
-    let raw_audio = tts
+    let raw_audio = tts_single
         .tts_raw_audio(&input, "en-us", &voice, speed, initial_silence)
         .map_err(SpeechError::Koko)?;
 
@@ -462,7 +501,7 @@ async fn handle_tts(
 /// Uses micro-chunking and parallel processing for low-latency streaming.
 /// Maintains speech order while allowing out-of-order chunk completion.
 async fn handle_tts_streaming(
-    tts: TTSKoko,
+    tts_instances: Vec<TTSKoko>,
     input: String,
     voice: String,
     response_format: AudioFormat,
@@ -475,17 +514,16 @@ async fn handle_tts_streaming(
         _ => "audio/pcm", // Force PCM for optimal streaming performance
     };
 
-    // Create worker pool with controlled concurrency
-    // Using staggered starts to prevent memory corruption while allowing parallelism
-    let worker_pool = TTSWorkerPool::new(tts.clone(), 4); // Increased to 4 concurrent workers for faster processing
+    // Create worker pool with vector of TTS instances for true parallelism
+    let worker_pool = TTSWorkerPool::new(tts_instances);
     
-    // Only chunk if message is longer than 500 words
+    // Only chunk if message is longer than 50 words
     let word_count = input.split_whitespace().count();
-    let chunks = if word_count < 500 {
+    let chunks = if word_count < 50 {
         vec![input.clone()]
     } else {
         // Create speech chunks based on word count and punctuation
-        tts.split_text_into_speech_chunks(&input, 10) // ~10 words per chunk for faster streaming
+        split_text_into_speech_chunks(&input, 10) // ~10 words per chunk for faster streaming
     };
     let total_chunks = chunks.len();
     
@@ -552,9 +590,9 @@ async fn handle_tts_streaming(
         let mut total_processed = 0;
         
         // Collect results and stream in order
-        // Start streaming when 40% of text length is processed
+        // Start streaming immediately (0% threshold for testing)
         let input_length = input.len();
-        let early_streaming_threshold = (input_length as f32 * 0.40) as usize;
+        let early_streaming_threshold = (input_length as f32 * 0.0) as usize;
         let mut early_streaming_started = false;
         
         while let Some(chunk) = result_rx.recv().await {
@@ -667,8 +705,8 @@ async fn handle_tts_streaming(
         })?)
 }
 
-async fn handle_voices(State(tts): State<TTSKoko>) -> Json<VoicesResponse> {
-    let voices = tts.get_available_voices();
+async fn handle_voices(State((tts_single, _tts_instances)): State<(TTSKoko, Vec<TTSKoko>)>) -> Json<VoicesResponse> {
+    let voices = tts_single.get_available_voices();
     Json(VoicesResponse { voices })
 }
 

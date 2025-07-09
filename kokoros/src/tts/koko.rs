@@ -7,8 +7,15 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use lazy_static::lazy_static;
 
 use espeak_rs::text_to_phonemes;
+
+// Global mutex to serialize espeak-rs calls to prevent phoneme randomization
+// espeak-rs uses global state internally and is not thread-safe
+lazy_static! {
+    static ref ESPEAK_MUTEX: Mutex<()> = Mutex::new(());
+}
 
 #[derive(Debug, Clone)]
 pub struct TTSOpts<'a> {
@@ -26,6 +33,16 @@ pub struct TTSKoko {
     #[allow(dead_code)]
     model_path: String,
     model: Arc<Mutex<ort_koko::OrtKoko>>,
+    styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
+    init_config: InitConfig,
+}
+
+/// Parallel TTS with multiple ONNX instances for true concurrency
+#[derive(Clone)]
+pub struct TTSKokoParallel {
+    #[allow(dead_code)]
+    model_path: String,
+    models: Vec<Arc<Mutex<ort_koko::OrtKoko>>>,
     styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
     init_config: InitConfig,
 }
@@ -98,9 +115,12 @@ impl TTSKoko {
             let sentence = format!("{}.", sentence.trim());
 
             // Convert to phonemes to check token count
-            let sentence_phonemes = text_to_phonemes(&sentence, "en", None, true, false)
-                .unwrap_or_default()
-                .join("");
+            let sentence_phonemes = {
+                let _guard = ESPEAK_MUTEX.lock().unwrap();
+                text_to_phonemes(&sentence, "en", None, true, false)
+                    .unwrap_or_default()
+                    .join("")
+            };
             let token_count = tokenize(&sentence_phonemes).len();
 
             if token_count > max_tokens {
@@ -115,9 +135,12 @@ impl TTSKoko {
                         format!("{} {}", word_chunk, word)
                     };
 
-                    let test_phonemes = text_to_phonemes(&test_chunk, "en", None, true, false)
-                        .unwrap_or_default()
-                        .join("");
+                    let test_phonemes = {
+                        let _guard = ESPEAK_MUTEX.lock().unwrap();
+                        text_to_phonemes(&test_chunk, "en", None, true, false)
+                            .unwrap_or_default()
+                            .join("")
+                    };
                     let test_tokens = tokenize(&test_phonemes).len();
 
                     if test_tokens > max_tokens {
@@ -136,9 +159,12 @@ impl TTSKoko {
             } else if !current_chunk.is_empty() {
                 // Try to append to current chunk
                 let test_text = format!("{} {}", current_chunk, sentence);
-                let test_phonemes = text_to_phonemes(&test_text, "en", None, true, false)
-                    .unwrap_or_default()
-                    .join("");
+                let test_phonemes = {
+                    let _guard = ESPEAK_MUTEX.lock().unwrap();
+                    text_to_phonemes(&test_text, "en", None, true, false)
+                        .unwrap_or_default()
+                        .join("")
+                };
                 let test_tokens = tokenize(&test_phonemes).len();
 
                 if test_tokens > max_tokens {
@@ -289,9 +315,12 @@ impl TTSKoko {
 
         for chunk in chunks {
             // Convert chunk to phonemes
-            let phonemes = text_to_phonemes(&chunk, lan, None, true, false)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-                .join("");
+            let phonemes = {
+                let _guard = ESPEAK_MUTEX.lock().unwrap();
+                text_to_phonemes(&chunk, lan, None, true, false)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+                    .join("")
+            };
             eprintln!("phonemes: {}", phonemes);
             let mut tokens = tokenize(&phonemes);
 
@@ -353,9 +382,12 @@ impl TTSKoko {
 
         for chunk in chunks {
             // Convert chunk to phonemes
-            let phonemes = text_to_phonemes(&chunk, lan, None, true, false)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-                .join("");
+            let phonemes = {
+                let _guard = ESPEAK_MUTEX.lock().unwrap();
+                text_to_phonemes(&chunk, lan, None, true, false)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+                    .join("")
+            };
             eprintln!("phonemes: {}", phonemes);
             let mut tokens = tokenize(&phonemes);
 
@@ -520,6 +552,126 @@ impl TTSKoko {
     }
 
     // Returns a sorted list of available voice names
+    pub fn get_available_voices(&self) -> Vec<String> {
+        let mut voices: Vec<String> = self.styles.keys().cloned().collect();
+        voices.sort();
+        voices
+    }
+}
+
+impl TTSKokoParallel {
+    pub async fn new_with_instances(model_path: &str, voices_path: &str, num_instances: usize) -> Self {
+        Self::from_config_with_instances(model_path, voices_path, InitConfig::default(), num_instances).await
+    }
+
+    pub async fn from_config_with_instances(model_path: &str, voices_path: &str, cfg: InitConfig, num_instances: usize) -> Self {
+        if !Path::new(model_path).exists() {
+            utils::fileio::download_file_from_url(cfg.model_url.as_str(), model_path)
+                .await
+                .expect("download model failed.");
+        }
+
+        if !Path::new(voices_path).exists() {
+            utils::fileio::download_file_from_url(cfg.voices_url.as_str(), voices_path)
+                .await
+                .expect("download voices data file failed.");
+        }
+
+        // Create multiple ONNX model instances
+        let mut models = Vec::new();
+        for i in 0..num_instances {
+            println!("Loading ONNX model instance {} of {}", i + 1, num_instances);
+            let model = Arc::new(Mutex::new(
+                ort_koko::OrtKoko::new(model_path.to_string())
+                    .expect("Failed to create Kokoro TTS model"),
+            ));
+            models.push(model);
+        }
+
+        let styles = TTSKoko::load_voices(voices_path);
+
+        TTSKokoParallel {
+            model_path: model_path.to_string(),
+            models,
+            styles,
+            init_config: cfg,
+        }
+    }
+
+    /// Get a specific model instance for a worker
+    pub fn get_model_instance(&self, worker_id: usize) -> Arc<Mutex<ort_koko::OrtKoko>> {
+        let index = worker_id % self.models.len();
+        Arc::clone(&self.models[index])
+    }
+
+    /// TTS processing with specific model instance (no global lock)
+    pub fn tts_raw_audio_with_instance(
+        &self,
+        text: &str,
+        language: &str,
+        style_name: &str,
+        speed: f32,
+        initial_silence: Option<usize>,
+        model_instance: Arc<Mutex<ort_koko::OrtKoko>>,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        // Convert text to phonemes
+        let phonemes = {
+            let _guard = ESPEAK_MUTEX.lock().unwrap();
+            text_to_phonemes(text, language, None, true, false)?
+        };
+        let phonemes = phonemes.join("");
+        println!("phonemes: {}", phonemes);
+
+        // Tokenize phonemes
+        let mut tokens = tokenize(&phonemes);
+        
+        // Add initial silence if specified
+        for _ in 0..initial_silence.unwrap_or(0) {
+            tokens.insert(0, 30);
+        }
+
+        // Get style vectors - create temporary TTSKoko instance to use mix_styles
+        let temp_tts = TTSKoko {
+            model_path: self.model_path.clone(),
+            model: Arc::clone(&self.models[0]), // Just for interface compatibility
+            styles: self.styles.clone(),
+            init_config: self.init_config.clone(),
+        };
+        let styles = temp_tts.mix_styles(style_name, tokens.len())?;
+
+        // pad a 0 to start and end of tokens
+        let mut padded_tokens = vec![0];
+        for &token in &tokens {
+            padded_tokens.push(token);
+        }
+        padded_tokens.push(0);
+
+        let tokens_vec = vec![padded_tokens];
+
+        println!("shape_style: {:?}", styles.len());
+
+        // Run TTS inference with provided model instance
+        let mut model = model_instance.lock().unwrap();
+        let audio = model.infer(tokens_vec, styles.clone(), speed)?;
+        
+        // Convert ndarray to Vec<f32>
+        let audio_vec: Vec<f32> = audio.iter().cloned().collect();
+        Ok(audio_vec)
+    }
+
+    /// Forward compatibility - split text method
+    pub fn split_text_into_speech_chunks(&self, text: &str, max_words: usize) -> Vec<String> {
+        // Use TTSKoko's implementation for now - create temporary instance
+        let temp_tts = TTSKoko {
+            model_path: self.model_path.clone(),
+            model: Arc::clone(&self.models[0]), // Just for interface compatibility
+            styles: self.styles.clone(),
+            init_config: self.init_config.clone(),
+        };
+        temp_tts.split_text_into_speech_chunks(text, max_words)
+    }
+
+    /// Get available voices
     pub fn get_available_voices(&self) -> Vec<String> {
         let mut voices: Vec<String> = self.styles.keys().cloned().collect();
         voices.sort();
