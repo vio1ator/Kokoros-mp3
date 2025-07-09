@@ -24,63 +24,217 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use futures::stream::StreamExt;
 use kokoros::{
     tts::koko::{InitConfig as TTSKokoInitConfig, TTSKoko},
     utils::mp3::pcm_to_mp3,
-    utils::wav::{write_audio_chunk, WavHeader},
+    utils::wav::{WavHeader, write_audio_chunk},
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+/// Break words used for chunk splitting
+const BREAK_WORDS: &[&str] = &[
+    "and", "or", "but", "&", "because", "if", "since", "though", "although", "however", "which",
+];
+
 /// Split text into speech chunks for streaming
-/// 
+///
 /// Prioritizes sentence boundaries over word count for natural speech breaks
+/// Then applies center-break word splitting for long chunks
 fn split_text_into_speech_chunks(text: &str, words_per_chunk: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current_chunk = String::new();
     let mut word_count = 0;
-    
+
+    // First pass: split by punctuation
     for word in text.split_whitespace() {
         if !current_chunk.is_empty() {
             current_chunk.push(' ');
         }
+        // Check for numbered list patterns: 1. 2) 3: (4), 5(\s)[.\)\:]
+        let is_numbered_break = is_numbered_list_item(word);
+
+        if is_numbered_break && !current_chunk.is_empty() {
+            chunks.push(current_chunk.trim().to_string());
+            current_chunk.clear();
+            word_count = 0;
+        }
         current_chunk.push_str(word);
         word_count += 1;
-        
-        // Check for sentence endings (major breaks)
-        let ends_with_sentence = word.ends_with('.') || word.ends_with('!') || word.ends_with('?');
-        
-        // Check for minor breaks (commas, semicolons, colons)
-        let ends_with_minor_punct = word.ends_with(',') || word.ends_with(';') || word.ends_with(':');
-        
-        // Split conditions (prioritize sentence boundaries):
-        // 1. Sentence ending + minimum word count reached
-        // 2. Minor punctuation + target word count reached
-        // 3. Hard limit to prevent overly long chunks
-        if (ends_with_sentence && word_count >= words_per_chunk / 2) ||
-           (ends_with_minor_punct && word_count >= words_per_chunk) ||
-           (word_count >= words_per_chunk * 3) {
+
+        // Check for unconditional breaks (always break regardless of word count)
+        let ends_with_unconditional = word.ends_with('.')
+            || word.ends_with('!')
+            || word.ends_with('?')
+            || word.ends_with(':')
+            || word.ends_with(';');
+
+        // Check for conditional breaks (commas - only break if enough words)
+        let ends_with_conditional = word.ends_with(',');
+
+        // Split conditions:
+        // 1. Unconditional punctuation - always break
+        // 2. Conditional punctuation + target word count reached
+        if ends_with_unconditional
+            || is_numbered_break
+            || (ends_with_conditional && word_count >= words_per_chunk)
+        {
             chunks.push(current_chunk.trim().to_string());
             current_chunk.clear();
             word_count = 0;
         }
     }
-    
+
     if !current_chunk.trim().is_empty() {
         chunks.push(current_chunk.trim().to_string());
     }
-    
-    chunks
+
+    // Debug: Show chunks after first pass (punctuation-based)
+    eprintln!(
+        "After first pass (punctuation-based), generated {} chunks:",
+        chunks.len()
+    );
+    for (i, chunk) in chunks.iter().enumerate() {
+        eprintln!("  Pre-split Chunk {}: '{}'", i, chunk);
+    }
+
+    // Second pass: apply center-break splitting for long chunks
+    // All chunks: ≥12 words
+    // First 2 chunks: punctuation priority, Others: break words only
+    let mut final_chunks = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let threshold = 12;
+        let use_punctuation = index < 2; // First 2 chunks can use punctuation
+        let split_chunks = split_long_chunk(chunk, threshold, use_punctuation);
+        final_chunks.extend(split_chunks);
+    }
+
+    // Final processing: Move break words from end of chunks to beginning of next chunk
+    for i in 0..final_chunks.len() - 1 {
+        let current_chunk = &final_chunks[i];
+        let words: Vec<&str> = current_chunk.split_whitespace().collect();
+
+        if let Some(last_word) = words.last() {
+            // Check if last word is a break word (case insensitive)
+            if BREAK_WORDS.contains(&last_word.to_lowercase().as_str()) {
+                // Remove break word from current chunk
+                let new_current = words[..words.len() - 1].join(" ");
+
+                // Add break word to beginning of next chunk
+                let next_chunk = &final_chunks[i + 1];
+                let new_next = format!("{} {}", last_word, next_chunk);
+
+                // Update the chunks
+                final_chunks[i] = new_current;
+                final_chunks[i + 1] = new_next;
+            }
+        }
+    }
+
+    final_chunks
+}
+
+/// Check if a word is a numbered list item: 1. 2) 3: (4), 5(\s)[.\)\:]
+fn is_numbered_list_item(word: &str) -> bool {
+    // Pattern matches: number followed by . ) or :
+    // Examples: "1.", "2)", "3:", "(4)", "(5),"
+    let numbered_regex = Regex::new(r"^\(?[0-9]+[.\)\:],?$").unwrap();
+    numbered_regex.is_match(word)
+}
+
+/// Split long chunks with punctuation priority (first 2 chunks) or break words only
+/// All chunks: ≥12 words threshold
+/// Break words: and, or, but, &, because, if, since, though, although, however, which
+fn split_long_chunk(chunk: &str, threshold: usize, use_punctuation: bool) -> Vec<String> {
+    let words: Vec<&str> = chunk.split_whitespace().collect();
+    let word_count = words.len();
+
+    // Only split if chunk meets the threshold
+    if word_count < threshold {
+        return vec![chunk.to_string()];
+    }
+
+    let center = word_count / 2;
+
+    if use_punctuation {
+        // Priority 1: Search for commas closest to center (only conditional punctuation left)
+        if let Some(pos) = find_closest_punctuation(&words, center, &[","]) {
+            if pos >= 3 {
+                let first_chunk = words[..pos].join(" ");
+                let second_chunk = words[pos..].join(" ");
+
+                // Recursively split both chunks if they're still too long
+                let mut result = Vec::new();
+                result.extend(split_long_chunk(&first_chunk, threshold, use_punctuation));
+                result.extend(split_long_chunk(&second_chunk, threshold, use_punctuation));
+                return result;
+            }
+        }
+    }
+
+    // Priority 2: Search for break words closest to center
+    if let Some(pos) = find_closest_break_word(&words, center, BREAK_WORDS) {
+        if pos >= 3 {
+            let first_chunk = words[..pos].join(" ");
+            let second_chunk = words[pos..].join(" ");
+
+            // Recursively split both chunks if they're still too long
+            let mut result = Vec::new();
+            result.extend(split_long_chunk(&first_chunk, threshold, use_punctuation));
+            result.extend(split_long_chunk(&second_chunk, threshold, use_punctuation));
+            return result;
+        }
+    }
+
+    // No suitable break point found, return original chunk
+    vec![chunk.to_string()]
+}
+
+/// Find closest punctuation to center (no left preference)
+fn find_closest_punctuation(words: &[&str], center: usize, punctuation: &[&str]) -> Option<usize> {
+    let mut closest_pos = None;
+    let mut min_distance = usize::MAX;
+
+    for (i, word) in words.iter().enumerate() {
+        if punctuation.iter().any(|p| word.ends_with(p)) {
+            let distance = if i < center { center - i } else { i - center };
+            if distance < min_distance {
+                min_distance = distance;
+                closest_pos = Some(i + 1); // Split after the punctuation
+            }
+        }
+    }
+
+    closest_pos
+}
+
+/// Find closest break word to center (no left preference)
+fn find_closest_break_word(words: &[&str], center: usize, break_words: &[&str]) -> Option<usize> {
+    let mut closest_pos = None;
+    let mut min_distance = usize::MAX;
+
+    for (i, word) in words.iter().enumerate() {
+        if break_words.contains(&word.to_lowercase().as_str()) {
+            let distance = if i < center { center - i } else { i - center };
+            if distance < min_distance {
+                min_distance = distance;
+                closest_pos = Some(i); // Break word becomes first word of second chunk
+            }
+        }
+    }
+
+    closest_pos
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -139,27 +293,26 @@ struct SpeechRequest {
 
     // OpenAI API compatibility parameters - accepted but not implemented
     // These fields ensure request parsing compatibility with OpenAI clients
-    
     /// Return download link after generation (not implemented)
     #[serde(default)]
     #[allow(dead_code)]
     return_download_link: Option<bool>,
-    
+
     /// Language code for text processing (not implemented)
     #[serde(default)]
     #[allow(dead_code)]
     lang_code: Option<String>,
-    
+
     /// Volume multiplier for output audio (not implemented)
     #[serde(default)]
     #[allow(dead_code)]
     volume_multiplier: Option<f32>,
-    
+
     /// Format for download when different from response_format (not implemented)
     #[serde(default)]
     #[allow(dead_code)]
     download_format: Option<String>,
-    
+
     /// Text normalization options (not implemented)
     #[serde(default)]
     #[allow(dead_code)]
@@ -183,7 +336,7 @@ struct TTSTask {
     voice: String,
     speed: f32,
     initial_silence: Option<usize>,
-    result_tx: mpsc::UnboundedSender<OrderedChunk>,
+    result_tx: mpsc::UnboundedSender<(usize, Vec<u8>)>,
 }
 
 /// Streaming session manager
@@ -209,75 +362,13 @@ impl TTSWorkerPool {
             max_concurrent: num_instances,
         }
     }
-    
+
     fn get_instance(&self, worker_id: usize) -> Arc<TTSKoko> {
         let index = worker_id % self.tts_instances.len();
         Arc::clone(&self.tts_instances[index])
     }
 
-    async fn process_chunk(&self, task: TTSTask) {
-        let start_time = Instant::now();
-        
-        // Clone data for the closure
-        let chunk_text = task.chunk.clone();
-        let voice = task.voice.clone();
-        let speed = task.speed;
-        let initial_silence = task.initial_silence;
-        let chunk_id = task.id;
-        
-        // Get dedicated TTS instance for this worker
-        let tts_instance = self.get_instance(chunk_id);
-        
-        eprintln!("Starting TTS processing for chunk {} with text: '{}'", chunk_id, &chunk_text);
-        
-        // Run TTS inference in a blocking thread with dedicated instance
-        // NO GLOBAL LOCK - each worker gets its own TTS instance
-        let result = tokio::task::spawn_blocking(move || {
-            eprintln!("Calling tts_raw_audio for chunk {} with dedicated instance", chunk_id);
-            let audio_result = tts_instance.tts_raw_audio(&chunk_text, "en-us", &voice, speed, initial_silence);
-            eprintln!("Completed tts_raw_audio call for chunk {}", chunk_id);
-            
-            audio_result.map(|audio| {
-                eprintln!("TTS success for chunk {}: {} samples", chunk_id, audio.len());
-                audio
-            }).map_err(|e| {
-                eprintln!("TTS error for chunk {}: {:?}", chunk_id, e);
-                format!("TTS processing error: {:?}", e)
-            })
-        }).await;
-        
-        let processing_time = start_time.elapsed();
-        
-        let mut ordered_chunk = OrderedChunk {
-            id: task.id,
-            text: task.chunk,
-            audio_data: None,
-            processing_time: Some(processing_time),
-        };
-        
-        match result {
-            Ok(Ok(audio_samples)) => {
-                // Convert f32 samples to 16-bit PCM
-                let mut pcm_data = Vec::with_capacity(audio_samples.len() * 2);
-                for sample in audio_samples {
-                    let pcm_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                    pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
-                }
-                ordered_chunk.audio_data = Some(pcm_data);
-            }
-            Ok(Err(e)) => {
-                eprintln!("TTS processing error for chunk {}: {}", task.id, e);
-            }
-            Err(e) => {
-                eprintln!("Task execution error for chunk {}: {:?}", task.id, e);
-            }
-        }
-        
-        // Send result back
-        if let Err(_) = task.result_tx.send(ordered_chunk) {
-            eprintln!("Failed to send result for chunk {}", task.id);
-        }
-    }
+    // process_chunk method removed - now handled inline in sequential queue processing
 }
 
 #[derive(Serialize)]
@@ -303,7 +394,10 @@ pub async fn create_server(tts_instances: Vec<TTSKoko>) -> Router {
     println!("create_server() with {} TTS instances", tts_instances.len());
 
     // Use first instance for compatibility with non-streaming endpoints
-    let tts_single = tts_instances.first().cloned().expect("At least one TTS instance required");
+    let tts_single = tts_instances
+        .first()
+        .cloned()
+        .expect("At least one TTS instance required");
 
     Router::new()
         .route("/", get(handle_home))
@@ -365,11 +459,11 @@ async fn handle_tts(
     // Check if this is a streaming request by examining headers
     // The OpenAI SDK's with_streaming_response may set specific headers
     let headers = request.headers();
-    let is_streaming_request = 
+    let is_streaming_request =
         // Check Accept header for streaming indicators
         headers.get("accept")
             .and_then(|v| v.to_str().ok())
-            .map(|accept| accept.contains("text/event-stream") || 
+            .map(|accept| accept.contains("text/event-stream") ||
                          accept.contains("application/octet-stream") ||
                          accept.contains("*/*"))  // OpenAI SDK often uses */*
             .unwrap_or(false)
@@ -385,7 +479,7 @@ async fn handle_tts(
             .and_then(|v| v.to_str().ok())
             .map(|conn| conn.contains("keep-alive"))
             .unwrap_or(false);
-    
+
     // Log all headers for debugging
     eprintln!("=== Request Headers Debug ===");
     for (name, value) in headers.iter() {
@@ -396,7 +490,7 @@ async fn handle_tts(
     eprintln!("  Streaming detected: {}", is_streaming_request);
     eprintln!("=============================");
     eprintln!("About to parse request body...");
-    
+
     // Parse the JSON body
     let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
         .await
@@ -404,16 +498,15 @@ async fn handle_tts(
             eprintln!("Error reading request body: {:?}", e);
             SpeechError::Mp3Conversion(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
-    
+
     eprintln!("Successfully read {} bytes from request body", bytes.len());
     eprintln!("Request body content: {}", String::from_utf8_lossy(&bytes));
     eprintln!("About to parse JSON...");
-    
-    let speech_request: SpeechRequest = serde_json::from_slice(&bytes)
-        .map_err(|e| {
-            eprintln!("JSON parsing error: {:?}", e);
-            SpeechError::Mp3Conversion(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        })?;
+
+    let speech_request: SpeechRequest = serde_json::from_slice(&bytes).map_err(|e| {
+        eprintln!("JSON parsing error: {:?}", e);
+        SpeechError::Mp3Conversion(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    })?;
 
     eprintln!("Successfully parsed JSON request");
 
@@ -427,22 +520,39 @@ async fn handle_tts(
         ..
     } = speech_request;
 
-    eprintln!("Successfully destructured request: input='{}', voice='{}', stream={:?}", input, voice, stream);
+    eprintln!(
+        "Successfully destructured request: input='{}', voice='{}', stream={:?}",
+        input, voice, stream
+    );
 
     // Debug streaming decision
-    eprintln!("Streaming decision: stream={:?}, is_streaming_request={}", stream, is_streaming_request);
-    
+    eprintln!(
+        "Streaming decision: stream={:?}, is_streaming_request={}",
+        stream, is_streaming_request
+    );
+
     // Use async streaming only when:
     // 1. Explicitly requested via "stream": true, OR
     // 2. Voice-mode style streaming request (detected via specific headers)
     let should_stream = stream.unwrap_or(false) || is_streaming_request;
-    
+
     eprintln!("Final should_stream decision: {}", should_stream);
-    
+
     if should_stream {
-        eprintln!("Using async streaming: explicit={}, detected_streaming_headers={}", 
-                  stream.unwrap_or(false), is_streaming_request);
-        return handle_tts_streaming(tts_instances, input, voice, response_format, speed, initial_silence).await;
+        eprintln!(
+            "Using async streaming: explicit={}, detected_streaming_headers={}",
+            stream.unwrap_or(false),
+            is_streaming_request
+        );
+        return handle_tts_streaming(
+            tts_instances,
+            input,
+            voice,
+            response_format,
+            speed,
+            initial_silence,
+        )
+        .await;
     }
 
     // Non-streaming mode (existing implementation)
@@ -497,7 +607,7 @@ async fn handle_tts(
 }
 
 /// Handle streaming TTS requests with true async processing
-/// 
+///
 /// Uses micro-chunking and parallel processing for low-latency streaming.
 /// Maintains speech order while allowing out-of-order chunk completion.
 async fn handle_tts_streaming(
@@ -516,23 +626,17 @@ async fn handle_tts_streaming(
 
     // Create worker pool with vector of TTS instances for true parallelism
     let worker_pool = TTSWorkerPool::new(tts_instances);
-    
-    // Only chunk if message is longer than 50 words
-    let word_count = input.split_whitespace().count();
-    let chunks = if word_count < 50 {
-        vec![input.clone()]
-    } else {
-        // Create speech chunks based on word count and punctuation
-        split_text_into_speech_chunks(&input, 10) // ~10 words per chunk for faster streaming
-    };
+
+    // Create speech chunks based on word count and punctuation
+    let chunks = split_text_into_speech_chunks(&input, 10);
     let total_chunks = chunks.len();
-    
+
     eprintln!("Input text: '{}'", input);
     eprintln!("Generated {} chunks:", total_chunks);
     for (i, chunk) in chunks.iter().enumerate() {
         eprintln!("  Chunk {}: '{}'", i, chunk);
     }
-    
+
     if chunks.is_empty() {
         return Err(SpeechError::Mp3Conversion(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -540,23 +644,23 @@ async fn handle_tts_streaming(
         )));
     }
 
-    // Create channels for chunk processing
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<OrderedChunk>();
+    // Create channels for sequential chunk processing
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<TTSTask>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>(); // Tag chunks with order ID
-    
+
     // Create session for tracking
     let session = StreamingSession {
         session_id: Uuid::new_v4(),
         chunk_count: total_chunks,
         start_time: Instant::now(),
     };
-    
-    eprintln!("Starting async streaming session {} with {} chunks", session.session_id, total_chunks);
 
-    // Create semaphore to enforce max_concurrent limit
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_pool.max_concurrent));
+    eprintln!(
+        "Starting sequential streaming session {} with {} chunks",
+        session.session_id, total_chunks
+    );
 
-    // Spawn worker tasks for all chunks with proper concurrency control
+    // Queue all tasks in order for sequential processing
     for (id, chunk) in chunks.into_iter().enumerate() {
         let task = TTSTask {
             id,
@@ -564,124 +668,125 @@ async fn handle_tts_streaming(
             voice: voice.clone(),
             speed,
             initial_silence: if id == 0 { initial_silence } else { None },
-            result_tx: result_tx.clone(),
+            result_tx: audio_tx.clone(),
         };
-        
-        let worker_pool_clone = worker_pool.clone();
-        let semaphore_clone = Arc::clone(&semaphore);
-        tokio::spawn(async move {
-            // Acquire semaphore permit to limit concurrency
-            let _permit = semaphore_clone.acquire().await.unwrap();
-            let task_id = task.id; // Extract ID before moving task
-            eprintln!("Acquired semaphore permit for chunk {}", task_id);
-            worker_pool_clone.process_chunk(task).await;
-            eprintln!("Released semaphore permit for chunk {}", task_id);
-        });
-    }
-    
-    // Drop the main result_tx to allow shutdown
-    drop(result_tx);
 
-    // Spawn ordering and streaming task
-    let audio_tx_clone = audio_tx.clone();
+        task_tx.send(task).unwrap();
+    }
+
+    // Drop the task sender to signal completion
+    drop(task_tx);
+
+    // Single consumer processes tasks sequentially with dedicated instances
+    let worker_pool_clone = worker_pool.clone();
     tokio::spawn(async move {
-        let mut completed_chunks = std::collections::HashMap::new();
-        let mut next_chunk_id = 0;
-        let mut total_processed = 0;
-        
-        // Collect results and stream in order
-        // Start streaming immediately (0% threshold for testing)
-        let input_length = input.len();
-        let early_streaming_threshold = (input_length as f32 * 0.0) as usize;
-        let mut early_streaming_started = false;
-        
-        while let Some(chunk) = result_rx.recv().await {
-            total_processed += 1;
-            
-            eprintln!("Received chunk {} (processed: {}/{})", chunk.id, total_processed, total_chunks);
-            
-            if let Some(ref processing_time) = chunk.processing_time {
-                eprintln!("Chunk {} processed in {:?}", chunk.id, processing_time);
-            } else {
-                eprintln!("Chunk {} had no processing time (likely error)", chunk.id);
-            }
-            
-            if chunk.audio_data.is_none() {
-                eprintln!("WARNING: Chunk {} has no audio data", chunk.id);
-            }
-            
-            // Extract chunk_id before moving the chunk
-            let chunk_id = chunk.id;
-            completed_chunks.insert(chunk_id, chunk);
-            
-            // Start early streaming if we have enough text processed
-            let processed_text_length: usize = completed_chunks.values()
-                .map(|c| c.text.len())
-                .sum();
-            
-            if !early_streaming_started && processed_text_length >= early_streaming_threshold {
-                eprintln!("Early streaming triggered at {}% text completion ({}/{} chars)", 
-                         (processed_text_length as f32 / input_length as f32 * 100.0) as u32,
-                         processed_text_length, input_length);
-                early_streaming_started = true;
-            }
-            
-            // Send all consecutive chunks that are ready, starting from next_chunk_id
-            while let Some(ready_chunk) = completed_chunks.remove(&next_chunk_id) {
-                eprintln!("Streaming chunk {} in order immediately (text: '{}')", ready_chunk.id, &ready_chunk.text[..ready_chunk.text.len().min(30)]);
-                
-                if let Some(audio_data) = ready_chunk.audio_data {
-                    if audio_data.is_empty() {
-                        eprintln!("WARNING: Chunk {} has empty audio data", ready_chunk.id);
-                    } else {
-                        eprintln!("Sending audio data for chunk {} immediately: {} bytes", ready_chunk.id, audio_data.len());
-                        // Send chunk with its actual ID for proper ordering
-                        match audio_tx_clone.send((ready_chunk.id, audio_data)) {
-                            Ok(_) => eprintln!("Successfully sent chunk {} to HTTP stream", ready_chunk.id),
-                            Err(_) => {
-                                eprintln!("Failed to send audio chunk {} - receiver closed", ready_chunk.id);
-                                return;
-                            }
-                        }
+        let mut chunk_counter = 0;
+        while let Some(task) = task_rx.recv().await {
+            let task_id = task.id;
+            eprintln!("Processing chunk {} sequentially", task_id);
+
+            // Process chunk with dedicated TTS instance
+            let start_time = Instant::now();
+            let tts_instance = worker_pool_clone.get_instance(chunk_counter);
+            let chunk_text = task.chunk.clone();
+            let voice = task.voice.clone();
+            let speed = task.speed;
+            let initial_silence = task.initial_silence;
+
+            // Run TTS inference with dedicated instance
+            let result = tokio::task::spawn_blocking(move || {
+                eprintln!(
+                    "Calling tts_raw_audio for chunk {} with dedicated instance",
+                    task_id
+                );
+                let audio_result = tts_instance.tts_raw_audio(
+                    &chunk_text,
+                    "en-us",
+                    &voice,
+                    speed,
+                    initial_silence,
+                );
+                eprintln!("Completed tts_raw_audio call for chunk {}", task_id);
+
+                audio_result
+                    .map(|audio| {
+                        eprintln!("TTS success for chunk {}: {} samples", task_id, audio.len());
+                        audio
+                    })
+                    .map_err(|e| {
+                        eprintln!("TTS error for chunk {}: {:?}", task_id, e);
+                        format!("TTS processing error: {:?}", e)
+                    })
+            })
+            .await;
+
+            let processing_time = start_time.elapsed();
+            eprintln!("Chunk {} processed in {:?}", task_id, processing_time);
+
+            // Convert audio and send immediately (no buffering needed - sequential order guaranteed)
+            match result {
+                Ok(Ok(audio_samples)) => {
+                    // Convert f32 samples to 16-bit PCM
+                    let mut pcm_data = Vec::with_capacity(audio_samples.len() * 2);
+                    for sample in audio_samples {
+                        let pcm_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
                     }
-                } else {
-                    eprintln!("Skipping chunk {} due to missing audio data", ready_chunk.id);
+
+                    eprintln!(
+                        "Sending audio data for chunk {} immediately: {} bytes",
+                        task_id,
+                        pcm_data.len()
+                    );
+                    if let Err(_) = task.result_tx.send((task_id, pcm_data)) {
+                        eprintln!("Failed to send audio chunk {} - receiver closed", task_id);
+                        break;
+                    }
                 }
-                next_chunk_id += 1;
+                Ok(Err(e)) => {
+                    eprintln!("TTS processing error for chunk {}: {}", task_id, e);
+                }
+                Err(e) => {
+                    eprintln!("Task execution error for chunk {}: {:?}", task_id, e);
+                }
             }
-            
-            // Only log buffering if the chunk is still in the buffer (not sent immediately)
-            if completed_chunks.contains_key(&chunk_id) {
-                eprintln!("Buffering chunk {} - waiting for chunk {} to complete first", chunk_id, next_chunk_id);
-            }
-            
-            // Check if we've processed all chunks
-            if total_processed >= total_chunks {
-                eprintln!("All chunks processed, exiting ordering loop");
-                break;
-            }
+
+            chunk_counter += 1;
         }
-        
+
         let session_time = session.start_time.elapsed();
-        eprintln!("Async streaming session {} completed in {:?}", session.session_id, session_time);
-        
-        // Send termination signal and close the audio stream
-        eprintln!("All chunks sent to HTTP stream, sending termination signal");
-        // Send a special termination marker with empty data to signal end of stream
-        let _ = audio_tx_clone.send((total_chunks, vec![])); // Empty data as termination signal
-        drop(audio_tx_clone);
+        eprintln!(
+            "Sequential streaming session {} completed in {:?}",
+            session.session_id, session_time
+        );
+
+        // Send termination signal
+        eprintln!("All chunks processed sequentially, sending termination signal");
+        let _ = audio_tx.send((total_chunks, vec![])); // Empty data as termination signal
     });
+
+    // No ordering needed - sequential processing guarantees order
 
     // Create immediate streaming - chunks are already sent in order from TTS processing
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(audio_rx)
         .map(|(chunk_id, data)| -> Result<Vec<u8>, std::io::Error> {
             // Check for termination signal (empty data)
             if data.is_empty() {
-                eprintln!("HTTP stream received termination signal (chunk {}) - ending stream", chunk_id);
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Stream complete"));
+                eprintln!(
+                    "HTTP stream received termination signal (chunk {}) - ending stream",
+                    chunk_id
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Stream complete",
+                ));
             }
-            
-            eprintln!("HTTP stream delivering chunk {} immediately: {} bytes", chunk_id, data.len());
+
+            eprintln!(
+                "HTTP stream delivering chunk {} immediately: {} bytes",
+                chunk_id,
+                data.len()
+            );
             Ok(data)
         })
         .take_while(|result| {
@@ -705,13 +810,15 @@ async fn handle_tts_streaming(
         })?)
 }
 
-async fn handle_voices(State((tts_single, _tts_instances)): State<(TTSKoko, Vec<TTSKoko>)>) -> Json<VoicesResponse> {
+async fn handle_voices(
+    State((tts_single, _tts_instances)): State<(TTSKoko, Vec<TTSKoko>)>,
+) -> Json<VoicesResponse> {
     let voices = tts_single.get_available_voices();
     Json(VoicesResponse { voices })
 }
 
 /// Handle /v1/models endpoint
-/// 
+///
 /// Returns a static list of models for OpenAI API compatibility.
 /// Note: All models use the same underlying Kokoro TTS engine.
 async fn handle_models() -> Json<ModelsResponse> {
@@ -766,4 +873,176 @@ async fn handle_model(Path(model_id): Path<String>) -> Result<Json<ModelObject>,
     };
 
     Ok(Json(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_short_text() {
+        let result = split_text_into_speech_chunks("Hello world", 10);
+        assert_eq!(result, vec!["Hello world"]);
+    }
+
+    #[test]
+    fn test_split_single_sentence() {
+        let text = "This is a simple sentence with enough words to trigger splitting.";
+        let result = split_text_into_speech_chunks(text, 10);
+        assert_eq!(
+            result,
+            vec!["This is a simple sentence with enough words to trigger splitting."]
+        );
+    }
+
+    #[test]
+    fn test_split_multiple_sentences() {
+        let text = "First sentence here. Second sentence follows. Third sentence ends.";
+        let result = split_text_into_speech_chunks(text, 10);
+        // Each sentence is <5 words, so won't split until ≥5 words (words_per_chunk/2)
+        assert!(result.len() >= 2);
+        assert!(result.iter().any(|chunk| chunk.contains("here.")));
+        assert!(result.iter().any(|chunk| chunk.contains("ends.")));
+    }
+
+    #[test]
+    fn test_split_with_comma() {
+        let text =
+            "The weather is nice today, and it will continue to be pleasant throughout the week.";
+        let result = split_text_into_speech_chunks(text, 10);
+        // Should split at comma since it's ≥10 words
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn test_hard_limit_trigger() {
+        let text = "This is an extremely long sentence that contains many words and should definitely trigger the hard limit for chunking because it exceeds thirty words which is the maximum allowed length.";
+        let result = split_text_into_speech_chunks(text, 10);
+        assert!(result.len() >= 2); // Should be split due to hard limit
+    }
+
+    #[test]
+    fn test_first_chunk_break_word_splitting() {
+        let text = "The implementation process requires careful planning and detailed analysis of system requirements which must be thoroughly documented.";
+        let result = split_text_into_speech_chunks(text, 10);
+        // First chunk is >10 words and contains "and", should be split
+        assert!(result.len() >= 2);
+        assert!(result[1].starts_with("and ") || result[1].starts_with("which "));
+    }
+
+    #[test]
+    fn test_later_chunk_break_word_splitting() {
+        let text = "Short first. This is a very long second chunk that contains many words and should be split because it exceeds fifteen words.";
+        let result = split_text_into_speech_chunks(text, 10);
+        // Second chunk is >15 words and contains break words, should be split
+        assert!(result.len() >= 3);
+    }
+
+    #[test]
+    fn test_split_long_chunk_below_threshold() {
+        let result = split_long_chunk("Short text with and", 10, true);
+        assert_eq!(result, vec!["Short text with and"]);
+    }
+
+    #[test]
+    fn test_split_long_chunk_at_threshold() {
+        let result = split_long_chunk("This text has exactly ten words and should split", 10, true);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1], "and should split");
+    }
+
+    #[test]
+    fn test_punctuation_priority_colon() {
+        let text = "The system performs three main functions: data processing, analysis generation, and report creation";
+        let result = split_long_chunk(text, 10, true);
+        assert_eq!(result.len(), 2);
+        // Should split at colon (highest priority) not comma or "and"
+        assert_eq!(
+            result[1],
+            "data processing, analysis generation, and report creation"
+        );
+    }
+
+    #[test]
+    fn test_punctuation_priority_comma() {
+        let text = "The research team analyzed comprehensive data, discovered significant patterns, and generated reports";
+        let result = split_long_chunk(text, 10, true);
+        assert_eq!(result.len(), 2);
+        // Should split at comma closest to center
+        assert!(result[1].starts_with("discovered") || result[1].starts_with("and"));
+    }
+
+    #[test]
+    fn test_break_word_only_mode() {
+        let text = "The system processes data, generates reports, and handles errors efficiently";
+        let result = split_long_chunk(text, 10, false);
+        assert_eq!(result.len(), 2);
+        // Should split at "and" (break word only, ignoring commas)
+        assert_eq!(result[1], "and handles errors efficiently");
+    }
+
+    #[test]
+    fn test_closest_to_center_no_left_preference() {
+        let text = "The system processes data but generates reports and handles errors";
+        let result = split_long_chunk(text, 10, true);
+        assert_eq!(result.len(), 2);
+        // Should split at whichever break word is closest to center
+        assert!(result[1].starts_with("but") || result[1].starts_with("and"));
+    }
+
+    #[test]
+    fn test_minimum_first_chunk_size() {
+        let text = "A B and this should not split because first chunk would be too small";
+        let result = split_long_chunk(text, 10, true);
+        // Should not split because first chunk would have <3 words
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_all_break_words() {
+        let break_words = [
+            "and", "or", "but", "&", "because", "if", "since", "though", "although", "however",
+            "which",
+        ];
+
+        for word in break_words.iter() {
+            let text = format!(
+                "The quick brown fox jumps {} the lazy dog sleeps peacefully",
+                word
+            );
+            let result = split_long_chunk(&text, 10, true);
+            assert_eq!(result.len(), 2, "Failed to split on break word: {}", word);
+            assert!(
+                result[1].starts_with(word),
+                "Second chunk should start with: {}",
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn test_complex_punctuation_and_break_words() {
+        let text = "The AI system processes natural language queries, analyzes context and intent, and generates appropriate responses. However, it requires extensive training data and computational resources, though recent advances have improved efficiency.";
+        let result = split_text_into_speech_chunks(text, 10);
+
+        // Should have multiple chunks due to punctuation and break word splitting
+        assert!(result.len() >= 3);
+
+        // Check that break words become first words of chunks
+        let has_break_word_start = result.iter().any(|chunk| {
+            let first_word = chunk.split_whitespace().next().unwrap_or("");
+            ["and", "however", "though"].contains(&first_word.to_lowercase().as_str())
+        });
+        assert!(has_break_word_start);
+    }
+
+    #[test]
+    fn test_differential_thresholds() {
+        let text = "Short first sentence. This is a medium length second sentence with exactly fourteen words total. This is a very long third sentence that contains many words and should definitely be split because it exceeds fifteen words.";
+        let result = split_text_into_speech_chunks(text, 10);
+
+        // First chunk (after punctuation) if ≥10 words should be split
+        // Later chunks only if ≥15 words should be split
+        assert!(result.len() >= 3);
+    }
 }
