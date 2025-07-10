@@ -1,6 +1,7 @@
 use crate::onn::ort_koko::{self};
 use crate::tts::tokenize::tokenize;
 use crate::utils;
+use crate::utils::debug::format_debug_prefix;
 use ndarray::Array3;
 use ndarray_npy::NpzReader;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use espeak_rs::text_to_phonemes;
 lazy_static! {
     static ref ESPEAK_MUTEX: Mutex<()> = Mutex::new(());
 }
+
 
 // Flag to ensure voice styles are only logged once
 static VOICES_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -312,6 +314,9 @@ impl TTSKoko {
         style_name: &str,
         speed: f32,
         initial_silence: Option<usize>,
+        request_id: Option<&str>,
+        instance_id: Option<&str>,
+        chunk_number: Option<usize>,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         // Split text into appropriate chunks
         let chunks = self.split_text_into_chunks(txt, 500); // Using 500 to leave 12 tokens of margin
@@ -325,7 +330,9 @@ impl TTSKoko {
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
                     .join("")
             };
-            tracing::debug!("phonemes: {}", phonemes);
+            let debug_prefix = format_debug_prefix(request_id, instance_id);
+            let chunk_info = chunk_number.map(|n| format!("Chunk: {}, ", n)).unwrap_or_default();
+            tracing::debug!("{} {}text: '{}' -> phonemes: '{}'", debug_prefix, chunk_info, chunk, phonemes);
             let mut tokens = tokenize(&phonemes);
 
             for _ in 0..initial_silence.unwrap_or(0) {
@@ -348,7 +355,7 @@ impl TTSKoko {
                 .model
                 .lock()
                 .unwrap()
-                .infer(tokens, styles.clone(), speed)
+                .infer(tokens, styles.clone(), speed, request_id, instance_id, chunk_number)
             {
                 Ok(chunk_audio) => {
                     let chunk_audio: Vec<f32> = chunk_audio.iter().cloned().collect();
@@ -376,6 +383,9 @@ impl TTSKoko {
         style_name: &str,
         speed: f32,
         initial_silence: Option<usize>,
+        request_id: Option<&str>,
+        instance_id: Option<&str>,
+        chunk_number: Option<usize>,
         mut chunk_callback: F,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
@@ -392,7 +402,9 @@ impl TTSKoko {
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
                     .join("")
             };
-            tracing::debug!("phonemes: {}", phonemes);
+            let debug_prefix = format_debug_prefix(request_id, instance_id);
+            let chunk_info = chunk_number.map(|n| format!("Chunk: {}, ", n)).unwrap_or_default();
+            tracing::debug!("{} {}text: '{}' -> phonemes: '{}'", debug_prefix, chunk_info, chunk, phonemes);
             let mut tokens = tokenize(&phonemes);
 
             for _ in 0..initial_silence.unwrap_or(0) {
@@ -415,7 +427,7 @@ impl TTSKoko {
                 .model
                 .lock()
                 .unwrap()
-                .infer(tokens, styles.clone(), speed)
+                .infer(tokens, styles.clone(), speed, request_id, instance_id, chunk_number)
             {
                 Ok(chunk_audio) => {
                     let chunk_audio: Vec<f32> = chunk_audio.iter().cloned().collect();
@@ -448,7 +460,7 @@ impl TTSKoko {
             initial_silence,
         }: TTSOpts,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let audio = self.tts_raw_audio(&txt, lan, style_name, speed, initial_silence)?;
+        let audio = self.tts_raw_audio(&txt, lan, style_name, speed, initial_silence, None, None, None)?;
 
         // Save to file
         if mono {
@@ -661,6 +673,9 @@ impl TTSKokoParallel {
         style_name: &str,
         speed: f32,
         initial_silence: Option<usize>,
+        request_id: Option<&str>,
+        instance_id: Option<&str>,
+        chunk_number: Option<usize>,
         model_instance: Arc<Mutex<ort_koko::OrtKoko>>,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         // Convert text to phonemes
@@ -669,7 +684,8 @@ impl TTSKokoParallel {
             text_to_phonemes(text, language, None, true, false)?
         };
         let phonemes = phonemes.join("");
-        tracing::debug!("phonemes: {}", phonemes);
+        let debug_prefix = format_debug_prefix(request_id, instance_id);
+        tracing::debug!("{} text: '{}' -> phonemes: '{}'", debug_prefix, text, phonemes);
 
         // Tokenize phonemes
         let mut tokens = tokenize(&phonemes);
@@ -701,7 +717,7 @@ impl TTSKokoParallel {
 
         // Run TTS inference with provided model instance
         let mut model = model_instance.lock().unwrap();
-        let audio = model.infer(tokens_vec, styles.clone(), speed)?;
+        let audio = model.infer(tokens_vec, styles.clone(), speed, request_id, instance_id, chunk_number)?;
         
         // Convert ndarray to Vec<f32>
         let audio_vec: Vec<f32> = audio.iter().cloned().collect();

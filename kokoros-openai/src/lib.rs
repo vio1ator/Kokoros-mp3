@@ -21,7 +21,6 @@
 use std::error::Error;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use axum::{
@@ -448,31 +447,9 @@ async fn handle_tts(
     request: axum::extract::Request,
 ) -> Result<Response, SpeechError> {
     let (request_id, request_start) = request.extensions().get::<(String, Instant)>().cloned().unwrap_or_else(|| ("unknown".to_string(), Instant::now()));
-    // Check if this is a streaming request by examining headers
-    // The OpenAI SDK's with_streaming_response may set specific headers
-    let headers = request.headers();
-    let is_streaming_request =
-        // Check Accept header for streaming indicators
-        headers.get("accept")
-            .and_then(|v| v.to_str().ok())
-            .map(|accept| accept.contains("text/event-stream") ||
-                         accept.contains("application/octet-stream") ||
-                         accept.contains("*/*"))  // OpenAI SDK often uses */*
-            .unwrap_or(false)
-        ||
-        // Check for Transfer-Encoding expectations
-        headers.get("te")
-            .and_then(|v| v.to_str().ok())
-            .map(|te| te.contains("chunked"))
-            .unwrap_or(false)
-        ||
-        // Check Connection header for streaming indicators
-        headers.get("connection")
-            .and_then(|v| v.to_str().ok())
-            .map(|conn| conn.contains("keep-alive"))
-            .unwrap_or(false);
-
-    debug!("Streaming request detected: {}", is_streaming_request);
+    
+    // OpenAI TTS always streams by default - client decides how to consume
+    // Only send complete file when explicitly requested via stream: false
 
     // Parse the JSON body
     let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
@@ -487,7 +464,6 @@ async fn handle_tts(
         SpeechError::Mp3Conversion(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
     })?;
 
-
     let SpeechRequest {
         input,
         voice: Voice(voice),
@@ -498,12 +474,11 @@ async fn handle_tts(
         ..
     } = speech_request;
 
-    // Use async streaming only when:
-    // 1. Explicitly requested via "stream": true, OR
-    // 2. Voice-mode style streaming request (detected via specific headers)
-    let should_stream = stream.unwrap_or(false) || is_streaming_request;
+    // OpenAI-compliant behavior: Stream by default, only send complete file if stream: false
+    let should_stream = stream.unwrap_or(true); // Default to streaming like OpenAI
 
-    debug!("Streaming decision: {}", should_stream);
+    let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
+    debug!("{} Streaming decision: stream_param={:?}, final_decision={}", colored_request_id, stream, should_stream);
 
     if should_stream {
         return handle_tts_streaming(
@@ -513,7 +488,6 @@ async fn handle_tts(
             response_format,
             speed,
             initial_silence,
-            "00".to_string(),
             request_id,
             request_start,
         )
@@ -522,7 +496,7 @@ async fn handle_tts(
 
     // Non-streaming mode (existing implementation)
     let raw_audio = tts_single
-        .tts_raw_audio(&input, "en-us", &voice, speed, initial_silence)
+        .tts_raw_audio(&input, "en-us", &voice, speed, initial_silence, Some(&request_id), Some("00"), None)
         .map_err(SpeechError::Koko)?;
 
     let sample_rate = TTSKokoInitConfig::default().sample_rate;
@@ -585,7 +559,6 @@ async fn handle_tts_streaming(
     response_format: AudioFormat,
     speed: f32,
     initial_silence: Option<usize>,
-    instance_id: String,
     request_id: String,
     request_start: Instant,
 ) -> Result<Response, SpeechError> {
@@ -602,7 +575,8 @@ async fn handle_tts_streaming(
     let chunks = split_text_into_speech_chunks(&input, 10);
     let total_chunks = chunks.len();
     
-    debug!("Processing {} chunks for streaming", total_chunks);
+    let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
+    debug!("{} Processing {} chunks for streaming", colored_request_id, total_chunks);
 
     if chunks.is_empty() {
         return Err(SpeechError::Mp3Conversion(std::io::Error::new(
@@ -624,7 +598,6 @@ async fn handle_tts_streaming(
         start_time: Instant::now(),
     };
     
-    let session_full = session.session_id.to_string();
     let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
     info!("{} TTS session started - {} chunks streaming", colored_request_id, total_chunks);
 
@@ -645,7 +618,7 @@ async fn handle_tts_streaming(
     // Drop the task sender to signal completion
     drop(task_tx);
 
-    // Single consumer processes tasks sequentially with dedicated instances
+    // Single consumer processes tasks sequentially with different instances
     let worker_pool_clone = worker_pool.clone();
     let total_bytes_clone = total_bytes.clone();
     tokio::spawn(async move {
@@ -653,13 +626,14 @@ async fn handle_tts_streaming(
         while let Some(task) = task_rx.recv().await {
             let task_id = task.id;
 
-            // Process chunk with dedicated TTS instance
+            // Process chunk with dedicated TTS instance (alternates between instances)
             let start_time = Instant::now();
-            let (tts_instance, _instance_id) = worker_pool_clone.get_instance(chunk_counter);
+            let (tts_instance, actual_instance_id) = worker_pool_clone.get_instance(chunk_counter);
             let chunk_text = task.chunk.clone();
             let voice = task.voice.clone();
             let speed = task.speed;
             let initial_silence = task.initial_silence;
+            let request_id_clone = request_id.clone();
 
             // Run TTS inference with dedicated instance
             let result = tokio::task::spawn_blocking(move || {
@@ -669,6 +643,9 @@ async fn handle_tts_streaming(
                     &voice,
                     speed,
                     initial_silence,
+                    Some(&request_id_clone),
+                    Some(&actual_instance_id),
+                    Some(chunk_counter),
                 );
 
                 audio_result
@@ -679,7 +656,7 @@ async fn handle_tts_streaming(
 
             let _processing_time = start_time.elapsed();
 
-            // Convert audio and send immediately (no buffering needed - sequential order guaranteed)
+            // Convert audio and send immediately (sequential order guaranteed)
             match result {
                 Ok(Ok(audio_samples)) => {
                     // Convert f32 samples to 16-bit PCM
@@ -821,45 +798,9 @@ async fn handle_model(Path(model_id): Path<String>) -> Result<Json<ModelObject>,
     Ok(Json(model))
 }
 
-// Global color counter for round-robin color assignment
-static COLOR_COUNTER: AtomicU8 = AtomicU8::new(0);
-
-const COLORS: &[&str] = &[
-    "\x1b[31m", // Red
-    "\x1b[32m", // Green  
-    "\x1b[33m", // Yellow
-    "\x1b[34m", // Blue
-    "\x1b[35m", // Magenta
-    "\x1b[36m", // Cyan
-    "\x1b[91m", // Bright Red
-    "\x1b[92m", // Bright Green
-    "\x1b[93m", // Bright Yellow
-    "\x1b[94m", // Bright Blue
-    "\x1b[95m", // Bright Magenta
-    "\x1b[96m", // Bright Cyan
-    "\x1b[37m", // White
-    "\x1b[90m", // Bright Black (Gray)
-];
-const RESET: &str = "\x1b[0m";
 
 fn get_colored_request_id_with_relative(request_id: &str, start_time: Instant) -> String {
-    // Use hash of request_id to consistently assign the same color
-    let mut hash = 0u32;
-    for byte in request_id.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(byte as u32);
-    }
-    let color_index = (hash as usize) % COLORS.len();
-    let color = COLORS[color_index];
-    
-    // Get relative time from request start
-    let elapsed_ms = start_time.elapsed().as_millis();
-    let relative_time = if elapsed_ms < 1 {
-        "    0".to_string()  // Show "0" right-aligned for initial request
-    } else {
-        format!("{:5}", elapsed_ms)  // Right-aligned 5 digits
-    };
-    
-    format!("{}[{}]{} \x1b[90m{}\x1b[0m", color, request_id, RESET, relative_time)
+    kokoros::utils::debug::get_colored_request_id_with_relative(request_id, start_time)
 }
 
 async fn request_id_middleware(
@@ -882,7 +823,7 @@ async fn request_id_middleware(
     info!("{} {} {} \"{}\"", colored_request_id, method, uri, user_agent);
     
     let response = next.run(request).await;
-    let latency = start.elapsed();
+    let _latency = start.elapsed();
     
     let colored_request_id_response = get_colored_request_id_with_relative(&request_id, start);
     info!("{} {}", colored_request_id_response, response.status());

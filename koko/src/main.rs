@@ -143,14 +143,19 @@ struct Cli {
     #[arg(long = "initial-silence", value_name = "INITIAL_SILENCE")]
     initial_silence: Option<usize>,
 
+    /// Number of TTS instances for parallel processing
+    #[arg(long = "instances", value_name = "INSTANCES", default_value_t = 2)]
+    instances: usize,
+
     #[command(subcommand)]
     mode: Mode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with Unix timestamp format
+    // Initialize tracing with Unix timestamp format and environment-based log level
     tracing_subscriber::fmt()
         .with_timer(UnixTimestampFormatter)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     
     let rt = tokio::runtime::Runtime::new()?;
@@ -163,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             speed,
             initial_silence,
             mono,
+            instances,
             mode,
         } = Cli::parse();
 
@@ -213,8 +219,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Mode::OpenAI { ip, port } => {
                 // Create multiple independent TTS instances for parallel processing
                 let mut tts_instances = Vec::new();
-                for i in 0..2 {
-                    tracing::info!("Initializing TTS instance [{}] ({}/2)", format!("{:02x}", i), i + 1);
+                for i in 0..instances {
+                    tracing::info!("Initializing TTS instance [{}] ({}/{})", format!("{:02x}", i), i + 1, instances);
                     let instance = TTSKoko::new(&model_path, &data_path).await;
                     tts_instances.push(instance);
                 }
@@ -249,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Process the line and get audio data
-                    match tts.tts_raw_audio(&stripped_line, &lan, &style, speed, initial_silence) {
+                    match tts.tts_raw_audio(&stripped_line, &lan, &style, speed, initial_silence, None, None, None) {
                         Ok(raw_audio) => {
                             // Write the raw audio samples directly
                             write_audio_chunk(&mut stdout, &raw_audio)?;
