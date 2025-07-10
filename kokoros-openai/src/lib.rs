@@ -40,8 +40,8 @@ use kokoros::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, info, error};
 use tower_http::cors::CorsLayer;
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 /// Break words used for chunk splitting
@@ -101,7 +101,6 @@ fn split_text_into_speech_chunks(text: &str, words_per_chunk: usize) -> Vec<Stri
         chunks.push(current_chunk.trim().to_string());
     }
 
-
     // Second pass: apply center-break splitting for long chunks
     // All chunks: ≥12 words
     // First 2 chunks: punctuation priority, Others: break words only
@@ -109,19 +108,19 @@ fn split_text_into_speech_chunks(text: &str, words_per_chunk: usize) -> Vec<Stri
     for (index, chunk) in chunks.iter().enumerate() {
         let threshold = 12;
         let use_punctuation = index < 2; // First 2 chunks can use punctuation
-        let split_chunks = split_long_chunk(chunk, threshold, use_punctuation);
+        let split_chunks = split_long_chunk_with_depth(chunk, threshold, use_punctuation, 0);
         final_chunks.extend(split_chunks);
     }
 
     // Final processing: Move break words from end of chunks to beginning of next chunk
     for i in 0..final_chunks.len() - 1 {
         let current_chunk = &final_chunks[i];
-        let words: Vec<&str> = current_chunk.split_whitespace().collect();
+        let words: Vec<&str> = current_chunk.trim().split_whitespace().collect();
 
         if let Some(last_word) = words.last() {
             // Check if last word is a break word (case insensitive)
-            if BREAK_WORDS.contains(&last_word.to_lowercase().as_str()) {
-                // Remove break word from current chunk
+            if BREAK_WORDS.contains(&last_word.to_lowercase().as_str()) && words.len() > 1 {
+                // Only move if it won't create an empty chunk (need more than 1 word)
                 let new_current = words[..words.len() - 1].join(" ");
 
                 // Add break word to beginning of next chunk
@@ -135,6 +134,11 @@ fn split_text_into_speech_chunks(text: &str, words_per_chunk: usize) -> Vec<Stri
         }
     }
 
+    // After all processing, there is no explicit filter to remove empty chunks.
+    // If any empty string slipped through (e.g., from .trim().to_string() on
+    // whitespace-only current_chunk, or from split_long_chunk), it would remain.
+    // Dont consider filtering out empty chunks here, to enable catching potential bugs
+    // in the chunking logic.
     final_chunks
 }
 
@@ -146,14 +150,12 @@ fn is_numbered_list_item(word: &str) -> bool {
     numbered_regex.is_match(word)
 }
 
-/// Split long chunks with punctuation priority (first 2 chunks) or break words only
-/// All chunks: ≥12 words threshold
-/// Break words: and, or, but, &, because, if, since, though, although, however, which
-fn split_long_chunk(chunk: &str, threshold: usize, use_punctuation: bool) -> Vec<String> {
-    split_long_chunk_with_depth(chunk, threshold, use_punctuation, 0)
-}
-
-fn split_long_chunk_with_depth(chunk: &str, threshold: usize, use_punctuation: bool, depth: usize) -> Vec<String> {
+fn split_long_chunk_with_depth(
+    chunk: &str,
+    threshold: usize,
+    use_punctuation: bool,
+    depth: usize,
+) -> Vec<String> {
     // Prevent infinite recursion
     if depth >= 3 {
         return vec![chunk.to_string()];
@@ -169,16 +171,26 @@ fn split_long_chunk_with_depth(chunk: &str, threshold: usize, use_punctuation: b
     let center = word_count / 2;
 
     if use_punctuation {
-        // Priority 1: Search for commas closest to center (only conditional punctuation left)
+        // Priority 1: Search for commas closest to center
         if let Some(pos) = find_closest_punctuation(&words, center, &[","]) {
-            if pos >= 3 {
+            if pos >= 3 && pos < words.len() {
                 let first_chunk = words[..pos].join(" ");
                 let second_chunk = words[pos..].join(" ");
 
                 // Recursively split both chunks if they're still too long
                 let mut result = Vec::new();
-                result.extend(split_long_chunk_with_depth(&first_chunk, threshold, use_punctuation, depth + 1));
-                result.extend(split_long_chunk_with_depth(&second_chunk, threshold, use_punctuation, depth + 1));
+                result.extend(split_long_chunk_with_depth(
+                    &first_chunk,
+                    threshold,
+                    use_punctuation,
+                    depth + 1,
+                ));
+                result.extend(split_long_chunk_with_depth(
+                    &second_chunk,
+                    threshold,
+                    use_punctuation,
+                    depth + 1,
+                ));
                 return result;
             }
         }
@@ -186,14 +198,24 @@ fn split_long_chunk_with_depth(chunk: &str, threshold: usize, use_punctuation: b
 
     // Priority 2: Search for break words closest to center
     if let Some(pos) = find_closest_break_word(&words, center, BREAK_WORDS) {
-        if pos >= 3 {
+        if pos >= 3 && pos < words.len() {
             let first_chunk = words[..pos].join(" ");
             let second_chunk = words[pos..].join(" ");
 
             // Recursively split both chunks if they're still too long
             let mut result = Vec::new();
-            result.extend(split_long_chunk_with_depth(&first_chunk, threshold, use_punctuation, depth + 1));
-            result.extend(split_long_chunk_with_depth(&second_chunk, threshold, use_punctuation, depth + 1));
+            result.extend(split_long_chunk_with_depth(
+                &first_chunk,
+                threshold,
+                use_punctuation,
+                depth + 1,
+            ));
+            result.extend(split_long_chunk_with_depth(
+                &second_chunk,
+                threshold,
+                use_punctuation,
+                depth + 1,
+            ));
             return result;
         }
     }
@@ -202,7 +224,7 @@ fn split_long_chunk_with_depth(chunk: &str, threshold: usize, use_punctuation: b
     vec![chunk.to_string()]
 }
 
-/// Find closest punctuation to center (no left preference)
+/// Find closest punctuation to center
 fn find_closest_punctuation(words: &[&str], center: usize, punctuation: &[&str]) -> Option<usize> {
     let mut closest_pos = None;
     let mut min_distance = usize::MAX;
@@ -220,7 +242,7 @@ fn find_closest_punctuation(words: &[&str], center: usize, punctuation: &[&str])
     closest_pos
 }
 
-/// Find closest break word to center (no left preference)
+/// Find closest break word to center
 fn find_closest_break_word(words: &[&str], center: usize, break_words: &[&str]) -> Option<usize> {
     let mut closest_pos = None;
     let mut min_distance = usize::MAX;
@@ -450,8 +472,12 @@ async fn handle_tts(
     State((tts_single, tts_instances)): State<(TTSKoko, Vec<TTSKoko>)>,
     request: axum::extract::Request,
 ) -> Result<Response, SpeechError> {
-    let (request_id, request_start) = request.extensions().get::<(String, Instant)>().cloned().unwrap_or_else(|| ("unknown".to_string(), Instant::now()));
-    
+    let (request_id, request_start) = request
+        .extensions()
+        .get::<(String, Instant)>()
+        .cloned()
+        .unwrap_or_else(|| ("unknown".to_string(), Instant::now()));
+
     // OpenAI TTS always streams by default - client decides how to consume
     // Only send complete file when explicitly requested via stream: false
 
@@ -482,7 +508,10 @@ async fn handle_tts(
     let should_stream = stream.unwrap_or(true); // Default to streaming like OpenAI
 
     let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
-    debug!("{} Streaming decision: stream_param={:?}, final_decision={}", colored_request_id, stream, should_stream);
+    debug!(
+        "{} Streaming decision: stream_param={:?}, final_decision={}",
+        colored_request_id, stream, should_stream
+    );
 
     if should_stream {
         return handle_tts_streaming(
@@ -500,7 +529,16 @@ async fn handle_tts(
 
     // Non-streaming mode (existing implementation)
     let raw_audio = tts_single
-        .tts_raw_audio(&input, "en-us", &voice, speed, initial_silence, Some(&request_id), Some("00"), None)
+        .tts_raw_audio(
+            &input,
+            "en-us",
+            &voice,
+            speed,
+            initial_silence,
+            Some(&request_id),
+            Some("00"),
+            None,
+        )
         .map_err(SpeechError::Koko)?;
 
     let sample_rate = TTSKokoInitConfig::default().sample_rate;
@@ -542,7 +580,12 @@ async fn handle_tts(
     };
 
     let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
-    info!("{} TTS non-streaming completed - {} bytes, {} format", colored_request_id, audio_data.len(), format_name);
+    info!(
+        "{} TTS non-streaming completed - {} bytes, {} format",
+        colored_request_id,
+        audio_data.len(),
+        format_name
+    );
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -576,11 +619,19 @@ async fn handle_tts_streaming(
     let worker_pool = TTSWorkerPool::new(tts_instances);
 
     // Create speech chunks based on word count and punctuation
-    let chunks = split_text_into_speech_chunks(&input, 10);
+    let mut chunks = split_text_into_speech_chunks(&input, 10);
+
+    // Add empty chunk at end as completion signal to client
+    chunks.push(String::new());
     let total_chunks = chunks.len();
-    
+
     let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
-    debug!("{} Processing {} chunks for streaming with window size {}", colored_request_id, total_chunks, worker_pool.instance_count());
+    debug!(
+        "{} Processing {} chunks for streaming with window size {}",
+        colored_request_id,
+        total_chunks,
+        worker_pool.instance_count()
+    );
 
     if chunks.is_empty() {
         return Err(SpeechError::Mp3Conversion(std::io::Error::new(
@@ -592,7 +643,7 @@ async fn handle_tts_streaming(
     // Create channels for sequential chunk processing
     let (task_tx, mut task_rx) = mpsc::unbounded_channel::<TTSTask>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>(); // Tag chunks with order ID
-    
+
     // Track total bytes transferred
     let total_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -601,9 +652,12 @@ async fn handle_tts_streaming(
         session_id: Uuid::new_v4(),
         start_time: Instant::now(),
     };
-    
+
     let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
-    info!("{} TTS session started - {} chunks streaming", colored_request_id, total_chunks);
+    info!(
+        "{} TTS session started - {} chunks streaming",
+        colored_request_id, total_chunks
+    );
 
     // Queue all tasks in order for sequential processing
     for (id, chunk) in chunks.into_iter().enumerate() {
@@ -629,70 +683,84 @@ async fn handle_tts_streaming(
     let total_chunks_expected = total_chunks;
     tokio::spawn(async move {
         use std::collections::BTreeMap;
-        
+
         let mut chunk_counter = 0;
-        let mut pending_chunks: BTreeMap<usize, tokio::task::JoinHandle<Result<(usize, Vec<u8>), String>>> = BTreeMap::new();
+        let mut pending_chunks: BTreeMap<
+            usize,
+            tokio::task::JoinHandle<Result<(usize, Vec<u8>), String>>,
+        > = BTreeMap::new();
         let mut next_to_send = 0;
         let mut chunks_processed = 0;
         let window_size = worker_pool_clone.instance_count(); // Allow chunks to process in parallel up to available TTS instances
-        
+
         loop {
             // Receive new tasks while we have window space and tasks are available
             while pending_chunks.len() < window_size {
                 // Use a non-blocking approach but with proper channel closure detection
                 match task_rx.try_recv() {
                     Ok(task) => {
-                    let task_id = task.id;
-                    let worker_pool_clone = worker_pool_clone.clone();
-                    let total_bytes_clone = total_bytes_clone.clone();
-                    let request_id_clone = request_id.clone();
-                    
-                    // Process chunk with dedicated TTS instance (alternates between instances)
-                    let (tts_instance, actual_instance_id) = worker_pool_clone.get_instance(chunk_counter);
-                    let chunk_text = task.chunk.clone();
-                    let voice = task.voice.clone();
-                    let speed = task.speed;
-                    let initial_silence = task.initial_silence;
-                    let chunk_num = chunk_counter;
-                    
-                    // Spawn parallel processing
-                    let handle = tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            let audio_result = tts_instance.tts_raw_audio(
-                                &chunk_text,
-                                "en-us",
-                                &voice,
-                                speed,
-                                initial_silence,
-                                Some(&request_id_clone),
-                                Some(&actual_instance_id),
-                                Some(chunk_num),
-                            );
+                        let task_id = task.id;
+                        let worker_pool_clone = worker_pool_clone.clone();
+                        let total_bytes_clone = total_bytes_clone.clone();
+                        let request_id_clone = request_id.clone();
 
-                            audio_result
-                                .map(|audio| audio)
-                                .map_err(|e| format!("TTS processing error: {:?}", e))
-                        })
-                        .await;
+                        // Process chunk with dedicated TTS instance (alternates between instances)
+                        let (tts_instance, actual_instance_id) =
+                            worker_pool_clone.get_instance(chunk_counter);
+                        let chunk_text = task.chunk.clone();
+                        let voice = task.voice.clone();
+                        let speed = task.speed;
+                        let initial_silence = task.initial_silence;
+                        let chunk_num = chunk_counter;
 
-                        // Convert audio to PCM
-                        match result {
-                            Ok(Ok(audio_samples)) => {
-                                let mut pcm_data = Vec::with_capacity(audio_samples.len() * 2);
-                                for sample in audio_samples {
-                                    let pcm_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                    pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
-                                }
-                                total_bytes_clone.fetch_add(pcm_data.len(), std::sync::atomic::Ordering::Relaxed);
-                                Ok((task_id, pcm_data))
+                        // Spawn parallel processing
+                        let handle = tokio::spawn(async move {
+                            // Handle empty chunks (completion signals) without TTS processing
+                            if chunk_text.trim().is_empty() {
+                                // Empty chunk - send as completion signal
+                                return Ok((task_id, Vec::new()));
                             }
-                            Ok(Err(e)) => Err(e),
-                            Err(e) => Err(format!("Task execution error: {:?}", e))
-                        }
-                    });
-                    
-                    pending_chunks.insert(chunk_counter, handle);
-                    chunk_counter += 1;
+
+                            let result = tokio::task::spawn_blocking(move || {
+                                let audio_result = tts_instance.tts_raw_audio(
+                                    &chunk_text,
+                                    "en-us",
+                                    &voice,
+                                    speed,
+                                    initial_silence,
+                                    Some(&request_id_clone),
+                                    Some(&actual_instance_id),
+                                    Some(chunk_num),
+                                );
+
+                                audio_result
+                                    .map(|audio| audio)
+                                    .map_err(|e| format!("TTS processing error: {:?}", e))
+                            })
+                            .await;
+
+                            // Convert audio to PCM
+                            match result {
+                                Ok(Ok(audio_samples)) => {
+                                    let mut pcm_data = Vec::with_capacity(audio_samples.len() * 2);
+                                    for sample in audio_samples {
+                                        let pcm_sample =
+                                            (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                        pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
+                                    }
+                                    total_bytes_clone.fetch_add(
+                                        pcm_data.len(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    Ok((task_id, pcm_data))
+                                }
+                                Ok(Err(e)) => Err(e),
+                                Err(e) => Err(format!("Task execution error: {:?}", e)),
+                            }
+                        });
+
+                        pending_chunks.insert(chunk_counter, handle);
+                        chunk_counter += 1;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                         // No tasks available right now, break inner loop to check completed chunks
@@ -704,7 +772,7 @@ async fn handle_tts_streaming(
                     }
                 }
             }
-            
+
             // Check if we can send the next chunk in order
             if let Some(handle) = pending_chunks.remove(&next_to_send) {
                 if handle.is_finished() {
@@ -722,7 +790,7 @@ async fn handle_tts_streaming(
                             chunks_processed += 1;
                         }
                         Err(_e) => {
-                            // Task execution error - skip this chunk  
+                            // Task execution error - skip this chunk
                             next_to_send += 1;
                             chunks_processed += 1;
                         }
@@ -732,29 +800,34 @@ async fn handle_tts_streaming(
                     pending_chunks.insert(next_to_send, handle);
                 }
             }
-            
+
             // Check if all chunks have been processed and sent
             // We're done when we've processed all expected chunks
             if chunks_processed >= total_chunks_expected {
                 break;
             }
-            
+
             // Also check if we have no more work to do (fallback safety check)
-            if pending_chunks.is_empty() && task_rx.is_empty() && chunks_processed < total_chunks_expected {
+            if pending_chunks.is_empty()
+                && task_rx.is_empty()
+                && chunks_processed < total_chunks_expected
+            {
                 // This shouldn't happen, but log it for debugging
-                eprintln!("Warning: Early termination detected - processed {} of {} chunks", chunks_processed, total_chunks_expected);
+                eprintln!(
+                    "Warning: Early termination detected - processed {} of {} chunks",
+                    chunks_processed, total_chunks_expected
+                );
                 break;
             }
-            
+
             // Small delay to prevent busy waiting
             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
 
-        
         // Wait for any remaining chunks to complete and collect them
         // This fixes the previous issue where only chunks matching next_to_send exactly were processed
         let mut remaining_chunks = Vec::new();
-        
+
         for (chunk_id, handle) in pending_chunks {
             match handle.await {
                 Ok(Ok((task_id, pcm_data))) => {
@@ -771,11 +844,11 @@ async fn handle_tts_streaming(
                 }
             }
         }
-        
+
         // Sort remaining chunks by chunk_id to maintain proper order
         // This ensures audio continuity even for out-of-order completions
         remaining_chunks.sort_by_key(|(chunk_id, _, _)| *chunk_id);
-        
+
         // Send all remaining chunks in order, preventing data loss
         for (chunk_id, task_id, pcm_data) in remaining_chunks {
             // Only send chunks that are in the expected sequence (>= next_to_send)
@@ -785,16 +858,19 @@ async fn handle_tts_streaming(
                 chunks_processed += 1;
             }
         }
-        
+
         let _session_time = session.start_time.elapsed();
-        
+
         // Log completion
         let bytes_transferred = total_bytes.load(std::sync::atomic::Ordering::Relaxed);
         // Calculate audio duration: 16-bit PCM (2 bytes per sample) at 24000 Hz
         let total_samples = bytes_transferred / 2;
         let duration_seconds = total_samples as f64 / 24000.0;
         let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
-        info!("{} TTS session completed - {} chunks, {} bytes, {:.1}s audio, PCM format", colored_request_id, total_chunks, bytes_transferred, duration_seconds);
+        info!(
+            "{} TTS session completed - {} chunks, {} bytes, {:.1}s audio, PCM format",
+            colored_request_id, total_chunks, bytes_transferred, duration_seconds
+        );
 
         // Send termination signal
         let _ = audio_tx.send((total_chunks, vec![])); // Empty data as termination signal
@@ -900,7 +976,6 @@ async fn handle_model(Path(model_id): Path<String>) -> Result<Json<ModelObject>,
     Ok(Json(model))
 }
 
-
 fn get_colored_request_id_with_relative(request_id: &str, start_time: Instant) -> String {
     kokoros::utils::debug::get_colored_request_id_with_relative(request_id, start_time)
 }
@@ -911,27 +986,28 @@ async fn request_id_middleware(
 ) -> axum::response::Response {
     let method = request.method().clone();
     let uri = request.uri().path().to_string();
-    let user_agent = request.headers()
+    let user_agent = request
+        .headers()
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-")
         .to_string();
-    
+
     let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let start = std::time::Instant::now();
     let colored_request_id = get_colored_request_id_with_relative(&request_id, start);
     request.extensions_mut().insert((request_id.clone(), start));
-    
-    info!("{} {} {} \"{}\"", colored_request_id, method, uri, user_agent);
-    
+
+    info!(
+        "{} {} {} \"{}\"",
+        colored_request_id, method, uri, user_agent
+    );
+
     let response = next.run(request).await;
     let _latency = start.elapsed();
-    
+
     let colored_request_id_response = get_colored_request_id_with_relative(&request_id, start);
     info!("{} {}", colored_request_id_response, response.status());
-    
+
     response
 }
-
-
-
