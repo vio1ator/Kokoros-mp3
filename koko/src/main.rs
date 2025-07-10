@@ -9,6 +9,20 @@ use std::{
     io::Write,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing_subscriber::fmt::time::FormatTime;
+
+/// Custom Unix timestamp formatter for tracing logs
+struct UnixTimestampFormatter;
+
+impl FormatTime for UnixTimestampFormatter {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let timestamp = format!("{}.{:06}", now.as_secs(), now.subsec_micros());
+        write!(w, "{}", timestamp)
+    }
+}
 
 #[derive(Subcommand, Debug)]
 enum Mode {
@@ -134,6 +148,11 @@ struct Cli {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing with Unix timestamp format
+    tracing_subscriber::fmt()
+        .with_timer(UnixTimestampFormatter)
+        .init();
+    
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let Cli {
@@ -195,14 +214,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Create multiple independent TTS instances for parallel processing
                 let mut tts_instances = Vec::new();
                 for i in 0..2 {
+                    tracing::info!("Initializing TTS instance [{}] ({}/2)", format!("{:02x}", i), i + 1);
                     let instance = TTSKoko::new(&model_path, &data_path).await;
-                    println!("Created TTS instance {}", i);
                     tts_instances.push(instance);
                 }
                 let app = kokoros_openai::create_server(tts_instances).await;
                 let addr = SocketAddr::from((ip, port));
                 let binding = tokio::net::TcpListener::bind(&addr).await?;
-                println!("Starting OpenAI-compatible HTTP server on {addr}");
+                tracing::info!("Starting OpenAI-compatible HTTP server on {}", addr);
                 kokoros_openai::serve(binding, app.into_make_service()).await?;
             }
 
