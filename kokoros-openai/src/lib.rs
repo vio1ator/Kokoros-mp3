@@ -357,6 +357,10 @@ impl TTSWorkerPool {
         (Arc::clone(&self.tts_instances[index]), instance_id)
     }
 
+    fn instance_count(&self) -> usize {
+        self.tts_instances.len()
+    }
+
     // process_chunk method removed - now handled inline in sequential queue processing
 }
 
@@ -576,7 +580,7 @@ async fn handle_tts_streaming(
     let total_chunks = chunks.len();
     
     let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
-    debug!("{} Processing {} chunks for streaming", colored_request_id, total_chunks);
+    debug!("{} Processing {} chunks for streaming with window size {}", colored_request_id, total_chunks, worker_pool.instance_count());
 
     if chunks.is_empty() {
         return Err(SpeechError::Mp3Conversion(std::io::Error::new(
@@ -618,72 +622,170 @@ async fn handle_tts_streaming(
     // Drop the task sender to signal completion
     drop(task_tx);
 
-    // Single consumer processes tasks sequentially with different instances
+    // Windowed parallel processing: allow chunks to process concurrently up to available TTS instances
     let worker_pool_clone = worker_pool.clone();
     let total_bytes_clone = total_bytes.clone();
+    let audio_tx_clone = audio_tx.clone();
+    let total_chunks_expected = total_chunks;
     tokio::spawn(async move {
+        use std::collections::BTreeMap;
+        
         let mut chunk_counter = 0;
-        while let Some(task) = task_rx.recv().await {
-            let task_id = task.id;
-
-            // Process chunk with dedicated TTS instance (alternates between instances)
-            let start_time = Instant::now();
-            let (tts_instance, actual_instance_id) = worker_pool_clone.get_instance(chunk_counter);
-            let chunk_text = task.chunk.clone();
-            let voice = task.voice.clone();
-            let speed = task.speed;
-            let initial_silence = task.initial_silence;
-            let request_id_clone = request_id.clone();
-
-            // Run TTS inference with dedicated instance
-            let result = tokio::task::spawn_blocking(move || {
-                let audio_result = tts_instance.tts_raw_audio(
-                    &chunk_text,
-                    "en-us",
-                    &voice,
-                    speed,
-                    initial_silence,
-                    Some(&request_id_clone),
-                    Some(&actual_instance_id),
-                    Some(chunk_counter),
-                );
-
-                audio_result
-                    .map(|audio| audio)
-                    .map_err(|e| format!("TTS processing error: {:?}", e))
-            })
-            .await;
-
-            let _processing_time = start_time.elapsed();
-
-            // Convert audio and send immediately (sequential order guaranteed)
-            match result {
-                Ok(Ok(audio_samples)) => {
-                    // Convert f32 samples to 16-bit PCM
-                    let mut pcm_data = Vec::with_capacity(audio_samples.len() * 2);
-                    for sample in audio_samples {
-                        let pcm_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                        pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
-                    }
-
-                    // Track bytes
-                    total_bytes_clone.fetch_add(pcm_data.len(), std::sync::atomic::Ordering::Relaxed);
+        let mut pending_chunks: BTreeMap<usize, tokio::task::JoinHandle<Result<(usize, Vec<u8>), String>>> = BTreeMap::new();
+        let mut next_to_send = 0;
+        let mut chunks_processed = 0;
+        let window_size = worker_pool_clone.instance_count(); // Allow chunks to process in parallel up to available TTS instances
+        
+        loop {
+            // Receive new tasks while we have window space and tasks are available
+            while pending_chunks.len() < window_size {
+                // Use a non-blocking approach but with proper channel closure detection
+                match task_rx.try_recv() {
+                    Ok(task) => {
+                    let task_id = task.id;
+                    let worker_pool_clone = worker_pool_clone.clone();
+                    let total_bytes_clone = total_bytes_clone.clone();
+                    let request_id_clone = request_id.clone();
                     
-                    if let Err(_) = task.result_tx.send((task_id, pcm_data)) {
+                    // Process chunk with dedicated TTS instance (alternates between instances)
+                    let (tts_instance, actual_instance_id) = worker_pool_clone.get_instance(chunk_counter);
+                    let chunk_text = task.chunk.clone();
+                    let voice = task.voice.clone();
+                    let speed = task.speed;
+                    let initial_silence = task.initial_silence;
+                    let chunk_num = chunk_counter;
+                    
+                    // Spawn parallel processing
+                    let handle = tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let audio_result = tts_instance.tts_raw_audio(
+                                &chunk_text,
+                                "en-us",
+                                &voice,
+                                speed,
+                                initial_silence,
+                                Some(&request_id_clone),
+                                Some(&actual_instance_id),
+                                Some(chunk_num),
+                            );
+
+                            audio_result
+                                .map(|audio| audio)
+                                .map_err(|e| format!("TTS processing error: {:?}", e))
+                        })
+                        .await;
+
+                        // Convert audio to PCM
+                        match result {
+                            Ok(Ok(audio_samples)) => {
+                                let mut pcm_data = Vec::with_capacity(audio_samples.len() * 2);
+                                for sample in audio_samples {
+                                    let pcm_sample = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                    pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
+                                }
+                                total_bytes_clone.fetch_add(pcm_data.len(), std::sync::atomic::Ordering::Relaxed);
+                                Ok((task_id, pcm_data))
+                            }
+                            Ok(Err(e)) => Err(e),
+                            Err(e) => Err(format!("Task execution error: {:?}", e))
+                        }
+                    });
+                    
+                    pending_chunks.insert(chunk_counter, handle);
+                    chunk_counter += 1;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        // No tasks available right now, break inner loop to check completed chunks
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        // Channel is closed, no more tasks will come
                         break;
                     }
                 }
-                Ok(Err(_e)) => {
-                    // TTS processing error - continue with next chunk
-                }
-                Err(_e) => {
-                    // Task execution error - continue with next chunk
+            }
+            
+            // Check if we can send the next chunk in order
+            if let Some(handle) = pending_chunks.remove(&next_to_send) {
+                if handle.is_finished() {
+                    match handle.await {
+                        Ok(Ok((task_id, pcm_data))) => {
+                            if let Err(_) = audio_tx_clone.send((task_id, pcm_data)) {
+                                break;
+                            }
+                            next_to_send += 1;
+                            chunks_processed += 1;
+                        }
+                        Ok(Err(_e)) => {
+                            // TTS processing error - skip this chunk
+                            next_to_send += 1;
+                            chunks_processed += 1;
+                        }
+                        Err(_e) => {
+                            // Task execution error - skip this chunk  
+                            next_to_send += 1;
+                            chunks_processed += 1;
+                        }
+                    }
+                } else {
+                    // Not finished yet, put it back
+                    pending_chunks.insert(next_to_send, handle);
                 }
             }
-
-            chunk_counter += 1;
+            
+            // Check if all chunks have been processed and sent
+            // We're done when we've processed all expected chunks
+            if chunks_processed >= total_chunks_expected {
+                break;
+            }
+            
+            // Also check if we have no more work to do (fallback safety check)
+            if pending_chunks.is_empty() && task_rx.is_empty() && chunks_processed < total_chunks_expected {
+                // This shouldn't happen, but log it for debugging
+                eprintln!("Warning: Early termination detected - processed {} of {} chunks", chunks_processed, total_chunks_expected);
+                break;
+            }
+            
+            // Small delay to prevent busy waiting
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         }
 
+        
+        // Wait for any remaining chunks to complete and collect them
+        // This fixes the previous issue where only chunks matching next_to_send exactly were processed
+        let mut remaining_chunks = Vec::new();
+        
+        for (chunk_id, handle) in pending_chunks {
+            match handle.await {
+                Ok(Ok((task_id, pcm_data))) => {
+                    // Collect all successful chunks regardless of order
+                    remaining_chunks.push((chunk_id, task_id, pcm_data));
+                }
+                Ok(Err(_e)) => {
+                    // TTS processing error - still count as processed
+                    chunks_processed += 1;
+                }
+                Err(_e) => {
+                    // Task execution error - still count as processed
+                    chunks_processed += 1;
+                }
+            }
+        }
+        
+        // Sort remaining chunks by chunk_id to maintain proper order
+        // This ensures audio continuity even for out-of-order completions
+        remaining_chunks.sort_by_key(|(chunk_id, _, _)| *chunk_id);
+        
+        // Send all remaining chunks in order, preventing data loss
+        for (chunk_id, task_id, pcm_data) in remaining_chunks {
+            // Only send chunks that are in the expected sequence (>= next_to_send)
+            // This prevents duplicate sends while ensuring no valid chunks are skipped
+            if chunk_id >= next_to_send {
+                let _ = audio_tx_clone.send((task_id, pcm_data));
+                chunks_processed += 1;
+            }
+        }
+        
         let _session_time = session.start_time.elapsed();
         
         // Log completion
