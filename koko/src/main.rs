@@ -9,6 +9,20 @@ use std::{
     io::Write,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing_subscriber::fmt::time::FormatTime;
+
+/// Custom Unix timestamp formatter for tracing logs
+struct UnixTimestampFormatter;
+
+impl FormatTime for UnixTimestampFormatter {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let timestamp = format!("{}.{:06}", now.as_secs(), now.subsec_micros());
+        write!(w, "{}", timestamp)
+    }
+}
 
 #[derive(Subcommand, Debug)]
 enum Mode {
@@ -129,11 +143,24 @@ struct Cli {
     #[arg(long = "initial-silence", value_name = "INITIAL_SILENCE")]
     initial_silence: Option<usize>,
 
+    /// Number of TTS instances for parallel processing
+    #[arg(long = "instances", value_name = "INSTANCES", default_value_t = 2)]
+    instances: usize,
+
     #[command(subcommand)]
     mode: Mode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing with Unix timestamp format and environment-based log level
+    tracing_subscriber::fmt()
+        .with_timer(UnixTimestampFormatter)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
+    
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let Cli {
@@ -144,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             speed,
             initial_silence,
             mono,
+            instances,
             mode,
         } = Cli::parse();
 
@@ -192,10 +220,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             Mode::OpenAI { ip, port } => {
-                let app = kokoros_openai::create_server(tts).await;
+                // Create multiple independent TTS instances for parallel processing
+                let mut tts_instances = Vec::new();
+                for i in 0..instances {
+                    tracing::info!("Initializing TTS instance [{}] ({}/{})", format!("{:02x}", i), i + 1, instances);
+                    let instance = TTSKoko::new(&model_path, &data_path).await;
+                    tts_instances.push(instance);
+                }
+                let app = kokoros_openai::create_server(tts_instances).await;
                 let addr = SocketAddr::from((ip, port));
                 let binding = tokio::net::TcpListener::bind(&addr).await?;
-                println!("Starting OpenAI-compatible HTTP server on {addr}");
+                tracing::info!("Starting OpenAI-compatible HTTP server on {}", addr);
                 kokoros_openai::serve(binding, app.into_make_service()).await?;
             }
 
@@ -223,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Process the line and get audio data
-                    match tts.tts_raw_audio(&stripped_line, &lan, &style, speed, initial_silence) {
+                    match tts.tts_raw_audio(&stripped_line, &lan, &style, speed, initial_silence, None, None, None) {
                         Ok(raw_audio) => {
                             // Write the raw audio samples directly
                             write_audio_chunk(&mut stdout, &raw_audio)?;

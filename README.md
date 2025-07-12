@@ -44,7 +44,8 @@ New Discord community: https://discord.gg/E566zfDWqD, Please join us if you inte
 
 ## Updates
 
-- **_`2025.01.22`_**: 🔥🔥🔥 **Streaming mode supported.** You can now using `--stream` to have fun with stream mode, kudos to [mroigo](https://github.com/mrorigo);
+- **_`2025.07.12`_**: 🔥🔥🔥 **HTTP API streaming and parallel processing infrastructure.** OpenAI-compatible server supports streaming audio generation with `"stream": true` achieving 1-2s time-to-first-audio, work-in-progress parallel TTS processing with `--instances` flag support, improved logging system with Unix timestamps, and natural-sounding voice generation through advanced chunking;
+- **_`2025.01.22`_**: 🔥🔥🔥 **CLI streaming mode supported.** You can now using `--stream` to have fun with stream mode, kudos to [mroigo](https://github.com/mrorigo);
 - **_`2025.01.17`_**: 🔥🔥🔥 Style mixing supported! Now, listen the output AMSR effect by simply specific style: `af_sky.4+af_nicole.5`;
 - **_`2025.01.15`_**: OpenAI compatible server supported, openai format still under polish!
 - **_`2025.01.15`_**: Phonemizer supported! Now `Kokoros` can inference E2E without anyother dependencies! Kudos to [@tstm](https://github.com/tstm);
@@ -105,6 +106,40 @@ For a file with 3 lines of text, by default, speech audio files `tmp/output_0.wa
 ./target/release/koko file lyrics.txt -o "song/lyric_{line}.wav"
 ```
 
+### Parallel Processing Configuration
+
+Configure parallel TTS instances for the OpenAI-compatible server based on your performance preference:
+
+```
+# Best 0.5-2 seconds time-to-first-audio (lowest latency)
+./target/release/koko openai --instances 1
+
+# Balanced performance (default, 2 instances, usually best throughput for CPU processing)
+./target/release/koko openai
+
+# Best total processing time (Diminishing returns on CPU processing observed on Mac M2)
+./target/release/koko openai --instances 4
+```
+
+**How to determine the optimal number of instances for your system configuration?**
+Choose your configuration based on use case:
+- Single instance for real-time applications requiring immediate audio response irrespective of system configuration.
+- Multiple instances for batch processing where total completion time matters more than initial latency.
+  - This was benchmarked on a Mac M2 with 8 cores and 24GB RAM.
+  - Tested with the message:
+    > Welcome to our comprehensive technology demonstration session. Today we will explore advanced parallel processing systems thoroughly. These systems utilize multiple computational instances simultaneously for efficiency. Each instance processes different segments concurrently without interference. The coordination between instances ensures seamless output delivery consistently. Modern algorithms optimize resource utilization effectively across all components. Performance improvements are measurable and significant in real scenarios. Quality assurance validates each processing stage thoroughly before deployment. Integration testing confirms system reliability consistently under various conditions. User experience remains smooth throughout operation regardless of complexity. Advanced monitoring tracks system performance metrics continuously during execution.
+  - Benchmark results (avg of 5)
+    | No. of instances | TTFA | Total time |
+    |------------------|------|------------|
+    | 1                | 1.44s | 19.0s     |
+    | 2                | 2.44s | 16.1s     |
+    | 4                | 4.98s | 16.6s     |
+  - If you have a CPU, memory bandwidth will be the usual bottleneck. You will have to experiment to find a sweet spot of number of instances giving you optimal throughput on your system configuration.
+  - If you have a NVIDIA GPU, you can try increasing the number of instances. You are expected to further improve throughput.
+  - Attempts to [make this work on CoreML](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html), would likely start with converting the ONNX model to CoreML or ORT.
+
+*Note: The `--instances` flag is currently supported in API server mode. CLI text commands will support parallel processing in future releases.*
+
 ### OpenAI-Compatible Server
 
 1. Start the server:
@@ -118,14 +153,37 @@ For a file with 3 lines of text, by default, speech audio files `tmp/output_0.wa
 Using curl:
 
 ```bash
+# Standard audio generation
 curl -X POST http://localhost:3000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "anything can go here",
+    "model": "tts-1",
     "input": "Hello, this is a test of the Kokoro TTS system!",
     "voice": "af_sky"
-  }'
+  }' \
   --output sky-says-hello.wav
+
+# Streaming audio generation (PCM format only)
+curl -X POST http://localhost:3000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "tts-1",
+    "input": "This is a streaming test with real-time audio generation.",
+    "voice": "af_sky",
+    "stream": true
+  }' \
+  --output streaming-audio.pcm
+
+# Live streaming playback (requires ffplay)
+curl -s -X POST http://localhost:3000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "tts-1",
+    "input": "Hello streaming world!",
+    "voice": "af_sky",
+    "stream": true
+  }' | \
+  ffplay -f s16le -ar 24000 -nodisp -autoexit -loglevel quiet -
 ```
 
 Using Python:
