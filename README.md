@@ -54,25 +54,41 @@ New Discord community: https://discord.gg/E566zfDWqD, Please join us if you inte
 
 ## Installation
 
-1. Install required Python packages:
+1. Download the required model and voice data files:
+
+```bash
+bash download_all.sh
+```
+
+This will download:
+- The Kokoro ONNX model (`checkpoints/kokoro-v1.0.onnx`)
+- The voices data file (`data/voices-v1.0.bin`)
+
+Alternatively, you can download them separately:
+```bash
+bash scripts/download_models.sh
+bash scripts/download_voices.sh
+```
+
+2. Build the project:
+
+```bash
+cargo build --release
+```
+
+3. (Optional) Install Python dependencies for OpenAI client examples:
 
 ```bash
 pip install -r scripts/requirements.txt
 ```
 
-2. Initialize voice data:
+4. (Optional) Install the binary and voice data system-wide:
 
 ```bash
-python scripts/fetch_voices.py
+bash install.sh
 ```
 
-This step fetches the required `voices.json` data file, which is necessary for voice synthesis.
-
-3. Build the project:
-
-```bash
-cargo build --release
-```
+This will copy the `koko` binary to `/usr/local/bin` (making it available system-wide as `koko`) and copy the voice data to `$HOME/.cache/kokoros/`.
 
 ## Usage
 
