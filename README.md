@@ -179,7 +179,7 @@ curl -X POST http://localhost:3000/v1/audio/speech \
   }' \
   --output sky-says-hello.wav
 
-# Streaming audio generation (PCM format only)
+# Streaming audio generation (MP3 stream)
 curl -X POST http://localhost:3000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
@@ -188,7 +188,7 @@ curl -X POST http://localhost:3000/v1/audio/speech \
     "voice": "af_sky",
     "stream": true
   }' \
-  --output streaming-audio.pcm
+  --output streaming-audio.mp3
 
 # Live streaming playback (requires ffplay)
 curl -s -X POST http://localhost:3000/v1/audio/speech \
@@ -199,7 +199,7 @@ curl -s -X POST http://localhost:3000/v1/audio/speech \
     "voice": "af_sky",
     "stream": true
   }' | \
-  ffplay -f s16le -ar 24000 -nodisp -autoexit -loglevel quiet -
+  ffplay -f mp3 -nodisp -autoexit -loglevel quiet -
 ```
 
 Using Python:

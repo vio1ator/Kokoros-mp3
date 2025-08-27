@@ -16,7 +16,7 @@
 //! - `volume_multiplier`: Not implemented (audio returned at original levels)
 //! - `download_format`: Not implemented (only response_format used)
 //! - `normalization_options`: Not implemented (basic text processing only)
-//! - Streaming only supports PCM format (other formats fall back to PCM)
+//! - Streaming outputs MP3 for best client compatibility
 
 use std::error::Error;
 use std::io;
@@ -609,11 +609,8 @@ async fn handle_tts_streaming(
     request_id: String,
     request_start: Instant,
 ) -> Result<Response, SpeechError> {
-    // Streaming implementation: PCM format for optimal performance
-    let content_type = match response_format {
-        AudioFormat::Pcm => "audio/pcm",
-        _ => "audio/pcm", // Force PCM for optimal streaming performance
-    };
+    // Stream MP3 regardless of requested format for compatibility
+    let content_type = "audio/mpeg";
 
     // Create worker pool with vector of TTS instances for true parallelism
     let worker_pool = TTSWorkerPool::new(tts_instances);
@@ -642,7 +639,7 @@ async fn handle_tts_streaming(
 
     // Create channels for sequential chunk processing
     let (task_tx, mut task_rx) = mpsc::unbounded_channel::<TTSTask>();
-    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>(); // Tag chunks with order ID
+    let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>(); // Tag chunks with order ID
 
     // Track total bytes transferred
     let total_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -868,7 +865,7 @@ async fn handle_tts_streaming(
         let duration_seconds = total_samples as f64 / 24000.0;
         let colored_request_id = get_colored_request_id_with_relative(&request_id, request_start);
         info!(
-            "{} TTS session completed - {} chunks, {} bytes, {:.1}s audio, PCM format",
+            "{} TTS session completed - {} chunks, {} bytes, {:.1}s audio, MP3 stream",
             colored_request_id, total_chunks, bytes_transferred, duration_seconds
         );
 
@@ -878,22 +875,41 @@ async fn handle_tts_streaming(
 
     // No ordering needed - sequential processing guarantees order
 
-    // Create immediate streaming - chunks are already sent in order from TTS processing
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(audio_rx)
-        .map(|(_chunk_id, data)| -> Result<Vec<u8>, std::io::Error> {
-            // Check for termination signal (empty data)
+    // Transcode ordered PCM chunks to MP3 per chunk using a fresh encoder (more stable)
+    let (encoded_tx, encoded_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let sample_rate = 24000u32;
+        while let Some((_chunk_id, data)) = audio_rx.recv().await {
             if data.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Stream complete",
-                ));
+                break; // end of stream
             }
-            Ok(data)
-        })
-        .take_while(|result| {
-            // Continue until we hit an error (termination signal)
-            std::future::ready(result.is_ok())
-        });
+            // Convert PCM i16 bytes back to f32 for encoder API
+            let mut samples_f32 = Vec::with_capacity(data.len() / 2);
+            for b in data.chunks_exact(2) {
+                let s = i16::from_le_bytes([b[0], b[1]]) as f32 / 32767.0;
+                samples_f32.push(s);
+            }
+            match tokio::task::spawn_blocking(move || {
+                kokoros::utils::mp3::pcm_to_mp3(&samples_f32, sample_rate)
+            })
+            .await
+            {
+                Ok(Ok(mp3_bytes)) => {
+                    if !mp3_bytes.is_empty() {
+                        let _ = encoded_tx.send(mp3_bytes);
+                    }
+                }
+                _ => {
+                    // skip on error
+                }
+            }
+        }
+        // closing encoded_tx ends the stream
+    });
+
+    // Create streaming body from encoded bytes
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(encoded_rx)
+        .map(|data| -> Result<Vec<u8>, std::io::Error> { Ok(data) });
 
     // Convert to HTTP body with explicit ordering
     let body = Body::from_stream(stream);
