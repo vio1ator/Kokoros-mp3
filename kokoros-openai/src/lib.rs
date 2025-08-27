@@ -112,33 +112,7 @@ fn split_text_into_speech_chunks(text: &str, words_per_chunk: usize) -> Vec<Stri
         final_chunks.extend(split_chunks);
     }
 
-    // Final processing: Move break words from end of chunks to beginning of next chunk
-    for i in 0..final_chunks.len() - 1 {
-        let current_chunk = &final_chunks[i];
-        let words: Vec<&str> = current_chunk.trim().split_whitespace().collect();
-
-        if let Some(last_word) = words.last() {
-            // Check if last word is a break word (case insensitive)
-            if BREAK_WORDS.contains(&last_word.to_lowercase().as_str()) && words.len() > 1 {
-                // Only move if it won't create an empty chunk (need more than 1 word)
-                let new_current = words[..words.len() - 1].join(" ");
-
-                // Add break word to beginning of next chunk
-                let next_chunk = &final_chunks[i + 1];
-                let new_next = format!("{} {}", last_word, next_chunk);
-
-                // Update the chunks
-                final_chunks[i] = new_current;
-                final_chunks[i + 1] = new_next;
-            }
-        }
-    }
-
-    // After all processing, there is no explicit filter to remove empty chunks.
-    // If any empty string slipped through (e.g., from .trim().to_string() on
-    // whitespace-only current_chunk, or from split_long_chunk), it would remain.
-    // Dont consider filtering out empty chunks here, to enable catching potential bugs
-    // in the chunking logic.
+    // Note: Do NOT move trailing break words to next chunk; we keep them attached
     final_chunks
 }
 
@@ -258,6 +232,101 @@ fn find_closest_break_word(words: &[&str], center: usize, break_words: &[&str]) 
     }
 
     closest_pos
+}
+
+// Helper: count words in a chunk
+fn count_words(s: &str) -> usize {
+    s.split_whitespace().count()
+}
+
+// Helper: check if chunk starts with a break word (case-insensitive)
+fn starts_with_break_word(s: &str) -> bool {
+    let mut it = s.split_whitespace();
+    if let Some(first) = it.next() {
+        let lw = first.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        return BREAK_WORDS.contains(&lw.as_str());
+    }
+    false
+}
+
+// Normalize chunks for better prosody: merge very short chunks and avoid leading conjunctions
+fn normalize_chunks(mut chunks: Vec<String>, max_words: usize, min_words: usize) -> Vec<String> {
+    // Trim and drop empty
+    chunks = chunks
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    if chunks.is_empty() {
+        return chunks;
+    }
+
+    // Pass 1: Merge very short chunks into previous when possible
+    let mut normalized: Vec<String> = Vec::new();
+    for c in chunks.into_iter() {
+        if let Some(last) = normalized.last_mut() {
+            let cw = count_words(&c);
+            let lw = count_words(last);
+            if cw < min_words && lw + cw <= max_words {
+                // Merge into previous
+                if last.is_empty() {
+                    *last = c;
+                } else {
+                    last.push(' ');
+                    last.push_str(&c);
+                }
+                continue;
+            }
+        }
+        normalized.push(c);
+    }
+
+    if normalized.is_empty() {
+        return normalized;
+    }
+
+    // Pass 2: Avoid leading conjunctions by attaching the leading word to the previous chunk when feasible
+    let mut i = 1usize;
+    while i < normalized.len() {
+        if starts_with_break_word(&normalized[i]) {
+            let first_word = normalized[i]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let rest = normalized[i][first_word.len()..].trim().to_string();
+
+            // Prefer attaching the conjunction to previous chunk if it doesn't exceed limit
+            let prev_len = count_words(&normalized[i - 1]);
+            if prev_len + 1 <= max_words + 4 {
+                // Append the conjunction to previous
+                normalized[i - 1].push(' ');
+                normalized[i - 1].push_str(&first_word);
+                if rest.is_empty() {
+                    // Remove empty chunk
+                    normalized.remove(i);
+                    continue; // Don't advance index
+                } else {
+                    normalized[i] = rest;
+                }
+            } else {
+                // If previous is too long, try to merge entire chunk if not too large
+                let cw = count_words(&normalized[i]);
+                if prev_len + cw <= max_words * 2 {
+                    // Clone the right-hand chunk to avoid simultaneous borrows
+                    let right = normalized[i].clone();
+                    normalized[i - 1].push(' ');
+                    normalized[i - 1].push_str(&right);
+                    normalized.remove(i);
+                    continue; // Don't advance index
+                }
+            }
+        }
+        i += 1;
+    }
+
+    normalized
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -613,10 +682,19 @@ async fn handle_tts_streaming(
     let content_type = "audio/mpeg";
 
     // Create worker pool with vector of TTS instances for true parallelism
-    let worker_pool = TTSWorkerPool::new(tts_instances);
+    let worker_pool = TTSWorkerPool::new(tts_instances.clone());
 
-    // Create speech chunks based on word count and punctuation
-    let mut chunks = split_text_into_speech_chunks(&input, 10);
+    // Reuse library's sentence/clause chunker for better prosody
+    let target_words = 20usize; // tuned target 18–24; choose 20
+    let min_words = 8usize;     // merge threshold for very short chunks
+    let mut chunks = if let Some(first) = tts_instances.first() {
+        first.split_text_into_speech_chunks(&input, target_words)
+    } else {
+        vec![input.clone()]
+    };
+
+    // Normalize chunks: merge very short ones and avoid leading conjunctions
+    chunks = normalize_chunks(chunks, target_words, min_words);
 
     // Add empty chunk at end as completion signal to client
     chunks.push(String::new());
